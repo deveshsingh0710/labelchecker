@@ -1,0 +1,116 @@
+{
+  "ruleset_version": "2011.1",
+  "name": "Legal Metrology (Packaged Commodities) Rules, 2011",
+  "description": "Standard mandatory declarations required on retail packaged commodities in India",
+  "rules": [
+    {
+      "rule_id": "LM_RULE_6_1_A_MFG",
+      "field": "manufacturer_name_and_address",
+      "title": "Manufacturer / Packer / Importer Identity & Address",
+      "description": "The name and complete address of the manufacturer, or where the manufacturer is not the packer, the name and address of the manufacturer and packer, or in case of imported packages, the name and address of the importer.",
+      "validation_type": "presence_or_composite",
+      "composite_fields": ["manufacturer_name_and_address", "packer_name_and_address", "importer_name_and_address"],
+      "format_regex": null,
+      "severity": "critical",
+      "weight": 3.0,
+      "legal_reference": "Rule 6(1)(a) & Rule 6(1)(ab) - Legal Metrology (Packaged Commodities) Rules, 2011",
+      "remediation": "Print the complete name and registered address of the manufacturer or packer, including city, state, and pincode."
+    },
+    {
+      "rule_id": "LM_RULE_6_1_B_COMMODITY",
+      "field": "commodity_name",
+      "title": "Generic Name of Commodity",
+      "description": "The common or generic names of the commodity contained in the package and, in case of packages with more than one product, the name and number or quantity of each product.",
+      "validation_type": "presence",
+      "format_regex": null,
+      "severity": "major",
+      "weight": 2.0,
+      "legal_reference": "Rule 6(1)(b) - Legal Metrology (Packaged Commodities) Rules, 2011",
+      "remediation": "Clearly state the common or generic name of the commodity on the principal display panel."
+    },
+    {
+      "rule_id": "LM_RULE_6_1_C_NET_QTY",
+      "field": "net_quantity",
+      "title": "Net Quantity with Standard Unit",
+      "description": "The net quantity, in terms of standard units of weight or measure (g, kg, ml, l, m, cm) or number, contained in the package.",
+      "validation_type": "format_and_unit",
+      "format_regex": "^\\d+(\\.\\d+)?\\s*(kg|g|gm|gms|gram|grams|ml|l|ltr|ltrs|liter|litres|litre|m|cm|mm|pieces?|pcs?|units?|N|U)$",
+      "severity": "critical",
+      "weight": 3.0,
+      "legal_reference": "Rule 6(1)(c) & Rule 11 - Legal Metrology (Packaged Commodities) Rules, 2011",
+      "remediation": "Specify the net quantity using approved SI units or symbols (e.g., 'g', 'kg', 'ml', 'l', or 'N' for numbers). Avoid non-standard notations."
+    },
+    {
+      "rule_id": "LM_RULE_6_1_D_MFG_DATE",
+      "field": "manufacture_date",
+      "title": "Month & Year of Manufacture / Packing",
+      "description": "The month and year in which the commodity is manufactured or pre-packed or imported, formatted clearly (e.g. MM/YYYY or Month YYYY).",
+      "validation_type": "format",
+      "format_regex": "^(0[1-9]|1[0-2]|[A-Za-z]{3,9})[/\\.\\-\\s]+(\\d{4}|\\d{2})$",
+      "severity": "major",
+      "weight": 2.0,
+      "legal_reference": "Rule 6(1)(d) - Legal Metrology (Packaged Commodities) Rules, 2011",
+      "remediation": "Provide the month and year of manufacture or packaging using standard numerical or alphabetical representations (e.g. '08/2026' or 'Aug 2026')."
+    },
+    {
+      "rule_id": "LM_RULE_6_1_E_MRP",
+      "field": "mrp",
+      "title": "Maximum Retail Price (MRP)",
+      "description": "The retail sale price of the package clearly stated as Maximum Retail Price (MRP) with currency symbol.",
+      "validation_type": "presence",
+      "format_regex": "^[₹RsINR\\.\\s]*\\d+(\\.\\d{1,2})?",
+      "severity": "critical",
+      "weight": 3.0,
+      "legal_reference": "Rule 6(1)(e) - Legal Metrology (Packaged Commodities) Rules, 2011",
+      "remediation": "Declare the Maximum Retail Price in Indian Rupees (e.g., 'MRP ₹ 150.00' or 'MRP Rs. 150.00')."
+    },
+    {
+      "rule_id": "LM_RULE_6_1_E_TAXES",
+      "field": "mrp",
+      "title": "MRP Inclusive of All Taxes Clause",
+      "description": "The retail sale price declaration must explicitly state 'inclusive of all taxes' or 'incl. of all taxes'.",
+      "validation_type": "custom_mrp_tax",
+      "format_regex": "(?i)(incl\\.?|inclusive)\\s*(of)?\\s*(all)?\\s*taxes",
+      "severity": "major",
+      "weight": 2.0,
+      "legal_reference": "Rule 6(1)(e) - Legal Metrology (Packaged Commodities) Rules, 2011",
+      "remediation": "Add the phrase 'inclusive of all taxes' or 'incl. of all taxes' directly adjacent to the MRP."
+    },
+    {
+      "rule_id": "LM_RULE_6_1_F_EXPIRY",
+      "field": "best_before_or_expiry_date",
+      "title": "Best Before or Use By Date",
+      "description": "For commodities that may become unfit for human consumption after a period of time, the 'best before' or 'use by' date, month, and year.",
+      "validation_type": "conditional_presence",
+      "format_regex": null,
+      "severity": "minor",
+      "weight": 1.0,
+      "legal_reference": "Rule 6(1)(f) - Legal Metrology (Packaged Commodities) Rules, 2011",
+      "remediation": "Provide 'Best before X months from packaging' or an explicit 'Use by / Expiry' date."
+    },
+    {
+      "rule_id": "LM_RULE_6_1_G_CONSUMER_CARE",
+      "field": "customer_care_details",
+      "title": "Consumer Care Redressal Mechanism",
+      "description": "The name, address, telephone number, and e-mail address of the person who can be or the office which can be contacted, in case of consumer complaints.",
+      "validation_type": "custom_consumer_care",
+      "format_regex": null,
+      "severity": "critical",
+      "weight": 3.0,
+      "legal_reference": "Rule 6(1)(g) - Legal Metrology (Packaged Commodities) Rules, 2011",
+      "remediation": "Provide at least one active consumer complaint channel (toll-free telephone number, email, or postal address) for consumer queries and grievances."
+    },
+    {
+      "rule_id": "LM_RULE_6_1_N_ORIGIN",
+      "field": "country_of_origin",
+      "title": "Country of Origin (Imported Commodities)",
+      "description": "The name of the country of origin or manufacture or assembly in case of imported commodities.",
+      "validation_type": "conditional_imported",
+      "format_regex": null,
+      "severity": "critical",
+      "weight": 3.0,
+      "legal_reference": "Rule 6(1)(n) - Legal Metrology (Packaged Commodities) Rules, 2011 (as amended 2017)",
+      "remediation": "If the commodity is imported, explicitly declare 'Country of Origin: [Country Name]'."
+    }
+  ]
+}
