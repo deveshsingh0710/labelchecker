@@ -214,9 +214,8 @@ class LabelFieldParser:
 
     def parse_net_quantity(self) -> ExtractedField:
         """Parses net quantity value and unit."""
-        # Standard Legal Metrology units: g, kg, ml, l, cm, m, N, U, pieces
         qty_pattern = re.compile(
-            r"(?:net\s*(?:wt\.?|weight|qty\.?|quantity)?[:\s\.]*)?(\d+(?:[\.,]\d+)?)\s*[\.\s]*(kg|g|gm|gms|gram|grams|ml|l|ltr|ltrs|liter|litres|litre|m|cm|mm|pieces?|pcs?|units?|N|U|9)\b",
+            r"(\d+(?:[\.,]\d+)?)\s*[\.\s]*(kg|g|gm|gms|gram|grams|ml|l|ltr|ltrs|liter|litres|litre|m|cm|mm|pieces?|pcs?|units?|N|U)\b",
             re.IGNORECASE
         )
         net_indicator = re.compile(r"\b(net\s*(?:wt\.?|weight|qty\.?|quantity)?)\b", re.IGNORECASE)
@@ -224,47 +223,46 @@ class LabelFieldParser:
         matched_lines: List[OCRLine] = []
         qty_value = None
         qty_unit = None
-
         qty_line = None
-        # Pass 1: Look for lines with quantity number & unit
-        for idx, line in enumerate(self.ocr.lines):
-            m = qty_pattern.search(line.text)
-            if m:
-                val = m.group(1).replace(",", ".")
-                unit = m.group(2).lower()
-                if unit == "9" and re.search(r"net", line.text, re.I):
-                    unit = "g"
-                # Exclude years like 2024
-                if float(val) in (2024, 2025, 2026) and unit in ("g", "u", "n"):
-                    continue
-                qty_value = val
-                qty_unit = unit
-                qty_line = line
-                matched_lines.append(line)
-                # Check if previous line had 'Net' indicator (e.g. Line 1: 'Net', Line 2: '5g')
-                if idx > 0 and net_indicator.search(self.ocr.lines[idx - 1].text) and not net_indicator.search(line.text):
-                    matched_lines.insert(0, self.ocr.lines[idx - 1])
-                break
 
-        # Pass 2: If 'Net' keyword is on a line, check adjacent lines (+1, +2)
+        # Pass 1: Prioritize lines near 'Net' / 'Quantity' indicator
+        for idx, line in enumerate(self.ocr.lines):
+            if net_indicator.search(line.text):
+                # Check on same line
+                m = qty_pattern.search(line.text)
+                if m:
+                    qty_value = m.group(1).replace(",", ".")
+                    qty_unit = m.group(2).lower()
+                    qty_line = line
+                    matched_lines = [line]
+                    break
+                # Check adjacent lines (+1, +2, -1)
+                for off in (1, 2, -1):
+                    t_idx = idx + off
+                    if 0 <= t_idx < len(self.ocr.lines):
+                        cand = self.ocr.lines[t_idx]
+                        m2 = qty_pattern.search(cand.text)
+                        if m2:
+                            qty_value = m2.group(1).replace(",", ".")
+                            qty_unit = m2.group(2).lower()
+                            qty_line = cand
+                            matched_lines = [line, cand] if off > 0 else [cand, line]
+                            break
+                if qty_value:
+                    break
+
+        # Pass 2: Fallback to any line with standard Legal Metrology SI unit
         if not qty_value:
-            for idx, line in enumerate(self.ocr.lines):
-                if net_indicator.search(line.text):
-                    for offset in (1, 2):
-                        if idx + offset < len(self.ocr.lines):
-                            target_line = self.ocr.lines[idx + offset]
-                            m = qty_pattern.search(target_line.text)
-                            if m:
-                                val = m.group(1).replace(",", ".")
-                                unit = m.group(2).lower()
-                                if unit == "9":
-                                    unit = "g"
-                                qty_value = val
-                                qty_unit = unit
-                                qty_line = target_line
-                                matched_lines = [line, target_line]
-                                break
-                    if qty_value:
+            for line in self.ocr.lines:
+                m = qty_pattern.search(line.text)
+                if m:
+                    val = m.group(1).replace(",", ".")
+                    unit = m.group(2).lower()
+                    if float(val) not in (2024, 2025, 2026):
+                        qty_value = val
+                        qty_unit = unit
+                        qty_line = line
+                        matched_lines = [line]
                         break
 
         found = qty_value is not None
