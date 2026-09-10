@@ -188,9 +188,9 @@ async def verify_label(
     else:
         raise HTTPException(status_code=400, detail="Must provide file_id, file, or sample_id")
 
-    # 2. Run OCR extraction
+    # 2. Run OCR extraction (multi-pass combining preprocessed and raw image)
     try:
-        ocr_result = ocr_engine.extract(str(prep_path))
+        ocr_result = ocr_engine.extract(str(prep_path), raw_image_path=str(raw_path))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"OCR extraction failed: {str(e)}")
 

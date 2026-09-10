@@ -52,7 +52,7 @@ class LabelFieldParser:
     def parse_manufacturer(self) -> tuple[ExtractedField, Optional[ExtractedField]]:
         """Parses manufacturer and packer names/addresses."""
         mfg_pattern = re.compile(
-            r"(?:mfd|mfg|manufactured|produced)\s*(?:&|and)?\s*(?:packed\s*by|by|at)?[:\s\.]+(.*)",
+            r"(?:mfd|mfg|manufactured|produced)\s*(?:&|and)?\s*(?:packed\s*by|by|at)[:\s\.]+(.*)",
             re.IGNORECASE
         )
         pincode_pattern = re.compile(r"\b\d{6}\b")
@@ -63,21 +63,29 @@ class LabelFieldParser:
 
         for idx, line in enumerate(self.ocr.lines):
             text = line.text.strip()
+            # Exclude lines that are date declarations
+            if re.search(r"\b(mfg|mfd)\s*(?:date|dt|\.)\b", text, re.IGNORECASE):
+                continue
+
             if mfg_pattern.search(text):
                 capturing = True
+                clean_m = re.search(r"\b((?:mfd|mfg|manufactured|produced)\b.*)", text, re.IGNORECASE)
                 mfg_lines.append(line)
-                mfg_text_parts.append(text)
+                mfg_text_parts.append(clean_m.group(1) if clean_m else text)
                 continue
             if capturing:
-                # Stop if encountering another distinct declaration
-                if re.search(r"\b(mrp|net\s*wt|pkg|pkd|packed\s*by|customer|consumer|exp)\b", text, re.IGNORECASE):
+                # Skip ingredient/additive lines
+                if re.search(r"\b(ins\s*\d+|ingredients?|flavours?|preservatives?)\b", text, re.IGNORECASE):
+                    continue
+                # Stop if encountering another distinct declaration or license header
+                if re.search(r"\b(mrp|net\s*wt|pkg|pkd|customer|consumer|exp|lic|fssai|ssa)\b", text, re.IGNORECASE):
                     break
                 mfg_lines.append(line)
                 mfg_text_parts.append(text)
                 # If we captured pincode and at least 2 lines, good candidate
                 if pincode_pattern.search(text) and len(mfg_lines) >= 2:
                     break
-                if len(mfg_lines) >= 4:
+                if len(mfg_lines) >= 5:
                     break
 
         mfg_found = len(mfg_lines) > 0
@@ -156,12 +164,30 @@ class LabelFieldParser:
                 details={"explicit_declaration": True}
             )
 
-        # Fallback: Look at top prominent lines (usually line 0 or 1 in blocks)
+        # Priority 2: Look for known commodity keywords in label lines
+        commodity_terms = re.compile(
+            r"\b(pan\s*masala|gutkha|roasted\s*almonds|almonds|cookies|dark\s*chocolate|chocolate|biscuits?|tea|coffee|potato\s*chips|chips|namkeen|atta|rice|flour|salt|sugar)\b",
+            re.IGNORECASE
+        )
+        for line in self.ocr.lines:
+            tm = commodity_terms.search(line.text)
+            if tm:
+                term_val = tm.group(0).strip().title()
+                return ExtractedField(
+                    field_name="commodity_name",
+                    value=term_val,
+                    raw_text=line.text,
+                    confidence=line.confidence,
+                    bounding_box=line.box,
+                    found=True,
+                    details={"explicit_declaration": False, "inferred_from_keyword": True}
+                )
+
+        # Fallback: Look at top prominent lines (excluding numbers, legal keywords)
         candidate = None
-        for line in self.ocr.lines[:4]:
+        for line in self.ocr.lines[:8]:
             t = line.text.strip()
-            # If not pure numbers or legal keyword
-            if len(t) > 3 and not re.search(r"\b(mrp|net|pkg|mfd|exp|rs|tel)\b", t, re.IGNORECASE):
+            if len(t) > 3 and not re.search(r"\b(mrp|net|qty|pkg|mfd|exp|rs|tel|batch|lot|date|tax|veg|fssai|lic|clean)\b", t, re.IGNORECASE):
                 candidate = line
                 break
 
@@ -189,39 +215,74 @@ class LabelFieldParser:
     def parse_net_quantity(self) -> ExtractedField:
         """Parses net quantity value and unit."""
         # Standard Legal Metrology units: g, kg, ml, l, cm, m, N, U, pieces
-        regex = re.compile(
+        qty_pattern = re.compile(
             r"(?:net\s*(?:wt\.?|weight|qty\.?|quantity)?[:\s\.]*)?(\d+(?:[\.,]\d+)?)\s*[\.\s]*(kg|g|gm|gms|gram|grams|ml|l|ltr|ltrs|liter|litres|litre|m|cm|mm|pieces?|pcs?|units?|N|U|9)\b",
             re.IGNORECASE
         )
+        net_indicator = re.compile(r"\b(net\s*(?:wt\.?|weight|qty\.?|quantity)?)\b", re.IGNORECASE)
 
-        matched_line = None
+        matched_lines: List[OCRLine] = []
         qty_value = None
         qty_unit = None
 
-        for line in self.ocr.lines:
-            m = regex.search(line.text)
+        qty_line = None
+        # Pass 1: Look for lines with quantity number & unit
+        for idx, line in enumerate(self.ocr.lines):
+            m = qty_pattern.search(line.text)
             if m:
                 val = m.group(1).replace(",", ".")
                 unit = m.group(2).lower()
-                # Tesseract frequently mistakes small lowercase 'g' for '9'
                 if unit == "9" and re.search(r"net", line.text, re.I):
                     unit = "g"
+                # Exclude years like 2024
+                if float(val) in (2024, 2025, 2026) and unit in ("g", "u", "n"):
+                    continue
                 qty_value = val
                 qty_unit = unit
-                matched_line = line
+                qty_line = line
+                matched_lines.append(line)
+                # Check if previous line had 'Net' indicator (e.g. Line 1: 'Net', Line 2: '5g')
+                if idx > 0 and net_indicator.search(self.ocr.lines[idx - 1].text) and not net_indicator.search(line.text):
+                    matched_lines.insert(0, self.ocr.lines[idx - 1])
                 break
 
-        found = matched_line is not None
-        # Legal Metrology standard symbols: g, kg, ml, l, cm, m, N, U
+        # Pass 2: If 'Net' keyword is on a line, check adjacent lines (+1, +2)
+        if not qty_value:
+            for idx, line in enumerate(self.ocr.lines):
+                if net_indicator.search(line.text):
+                    for offset in (1, 2):
+                        if idx + offset < len(self.ocr.lines):
+                            target_line = self.ocr.lines[idx + offset]
+                            m = qty_pattern.search(target_line.text)
+                            if m:
+                                val = m.group(1).replace(",", ".")
+                                unit = m.group(2).lower()
+                                if unit == "9":
+                                    unit = "g"
+                                qty_value = val
+                                qty_unit = unit
+                                qty_line = target_line
+                                matched_lines = [line, target_line]
+                                break
+                    if qty_value:
+                        break
+
+        found = qty_value is not None
         standard_units = {"g", "kg", "ml", "l", "m", "cm", "n", "u"}
         is_standard_unit = (qty_unit in standard_units) if qty_unit else False
+
+        avg_conf = qty_line.confidence if qty_line else (
+            (sum(l.confidence for l in matched_lines) / len(matched_lines)) if matched_lines else 0.0
+        )
+        merged_box = self._merge_boxes_from_lines(matched_lines) if matched_lines else None
+        raw_text_str = " ".join(l.text for l in matched_lines) if matched_lines else None
 
         return ExtractedField(
             field_name="net_quantity",
             value=f"{qty_value} {qty_unit}" if found else None,
-            raw_text=matched_line.text if matched_line else None,
-            confidence=matched_line.confidence if matched_line else 0.0,
-            bounding_box=matched_line.box if matched_line else None,
+            raw_text=raw_text_str,
+            confidence=avg_conf,
+            bounding_box=merged_box,
             found=found,
             details={
                 "quantity": float(qty_value) if qty_value else None,
@@ -233,48 +294,132 @@ class LabelFieldParser:
 
     def parse_mrp(self) -> ExtractedField:
         """Parses MRP amount and checks for 'inclusive of all taxes' declaration."""
-        # Detect numeric price (accounting for 'Rs', 'Ps', '₹', 'INR')
-        mrp_regex = re.compile(
-            r"(?:m\.?r\.?p\.?|max(?:imum)?\s*retail\s*price|rs\.?|ps\.?|inr|₹)?[:\s\.]*(?:rs\.?|ps\.?|inr|₹)?\s*(\d+(?:[\.,]\d{1,2})?)",
+        mrp_indicator_regex = re.compile(
+            r"\b(?:m\.?[rl1i]?\.?p\.?|m\.?l\.?r\??|mlr|mrp|max(?:imum)?\s*retail\s*price|rs\.?|inr)\b|₹|rs\.",
             re.IGNORECASE
         )
         tax_regex = re.compile(
-            r"(?:incl\.?|inclusive)\s*(?:of\s*)?(?:all\s*)?taxes|inclusive\s*ofall\s*taxes|incl(?:\.|\s)*taxes|all\s*taxes",
+            r"(?:incl\.?|inclusive|aincl)\s*(?:of\s*)?(?:all\s*)?taxes|inclusive\s*ofall\s*taxes|incl(?:\.|\s)*taxes|all\s*taxes|taxesya",
             re.IGNORECASE
         )
 
         matched_line = None
         mrp_amount = None
         has_tax_clause = False
-        all_mrp_lines = []
+        all_mrp_lines: List[OCRLine] = []
 
-        # First search explicitly for lines containing 'MRP' or '₹' or 'Rs'
+        # 1. Check for tax clause in all lines and raw text
         for line in self.ocr.lines:
-            text = line.text
-            if re.search(r"\b(mrp|m\.r\.p|retail\s*price)\b|₹|rs\.|ps\.", text, re.IGNORECASE):
-                all_mrp_lines.append(line)
-                m = mrp_regex.search(text)
-                if m and mrp_amount is None:
-                    num_str = m.group(1).replace(",", ".")
-                    # Exclude dates or pincodes
-                    if len(num_str) <= 7 and float(num_str) > 0 and float(num_str) != 2026:
-                        mrp_amount = num_str
-                        matched_line = line
-                if tax_regex.search(text):
-                    has_tax_clause = True
+            if tax_regex.search(line.text):
+                has_tax_clause = True
+                if line not in all_mrp_lines:
+                    all_mrp_lines.append(line)
 
-        # Check full raw text if tax clause is in an adjacent line
         if not has_tax_clause and tax_regex.search(self.ocr.raw_text):
             has_tax_clause = True
-            for l in self.ocr.lines:
-                if tax_regex.search(l.text) and l not in all_mrp_lines:
+
+        def extract_price(text: str) -> Optional[str]:
+            # Do NOT treat batch numbers, licenses, or phone numbers as prices
+            if re.search(r"\b(batch|lot|b\.?\s*no|lic|license|fssai|phone|tel)\b", text, re.I):
+                return None
+            # Remove date patterns (04/2024) and quantities (5g, 250g)
+            cleaned = re.sub(r"\b\d{1,2}[\/\.-]\d{2,4}\b", "", text)
+            cleaned = re.sub(r"\b\d+(?:\.\d+)?\s*(?:g|gm|gms|kg|ml|l|ltr|pcs|pieces|m|cm)\b", "", cleaned, flags=re.I)
+            m = re.search(r"(?:rs\.?|₹|inr)?\s*(\d+(?:[\.,]\d{1,2})?)\b", cleaned, re.I)
+            if m:
+                val = m.group(1).replace(",", ".")
+                num = float(val)
+                if 0.5 <= num <= 50000 and num not in (2024, 2025, 2026):
+                    return val
+            return None
+
+        # 2. Find lines matching MRP indicator or Tax clause
+        candidate_indices = [
+            i for i, l in enumerate(self.ocr.lines)
+            if mrp_indicator_regex.search(l.text) or tax_regex.search(l.text)
+        ]
+
+        # Pass A: Look for price on the same line as an MRP indicator
+        for idx in candidate_indices:
+            l = self.ocr.lines[idx]
+            p = extract_price(l.text)
+            if p:
+                mrp_amount = p
+                matched_line = l
+                if l not in all_mrp_lines:
                     all_mrp_lines.append(l)
+                break
+
+        # Pass B: Look for 2-decimal currency format in nearby lines (within +/- 4 lines of indicator/tax)
+        if not mrp_amount and candidate_indices:
+            nearby_set = set()
+            for c_idx in candidate_indices:
+                for off in range(-4, 5):
+                    t_idx = c_idx + off
+                    if 0 <= t_idx < len(self.ocr.lines):
+                        nearby_set.add(t_idx)
+
+            sorted_indices = sorted(nearby_set, key=lambda i: min(abs(i - c) for c in candidate_indices))
+
+            for idx in sorted_indices:
+                l = self.ocr.lines[idx]
+                if re.search(r"\b(batch|lot|b\.?\s*no|lic|license|fssai|ins|date|dt|mfg|exp)\b", l.text, re.I):
+                    continue
+                m_dec = re.search(r"\b(\d+\.\d{2})\b", l.text)
+                if m_dec:
+                    val = m_dec.group(1)
+                    num = float(val)
+                    if 0.5 <= num <= 50000 and num not in (2024, 2025, 2026):
+                        mrp_amount = val
+                        matched_line = l
+                        if l not in all_mrp_lines:
+                            all_mrp_lines.append(l)
+                        break
+
+        # Pass C: Look for standard 2-decimal currency amount e.g. 10.00 anywhere on label
+        if not mrp_amount:
+            for l in self.ocr.lines:
+                if re.search(r"\b(batch|lot|b\.?\s*no|lic|license|fssai|ins|date|dt|mfg|exp)\b", l.text, re.I):
+                    continue
+                m_dec = re.search(r"\b(\d+\.\d{2})\b", l.text)
+                if m_dec:
+                    val = m_dec.group(1)
+                    num = float(val)
+                    if 0.5 <= num <= 50000 and num not in (2024, 2025, 2026):
+                        mrp_amount = val
+                        matched_line = l
+                        if l not in all_mrp_lines:
+                            all_mrp_lines.append(l)
+                        break
+
+        # Pass D: Look across lines with explicit ₹ or Rs
+        if not mrp_amount:
+            for l in self.ocr.lines:
+                if re.search(r"₹|rs\.", l.text, re.I):
+                    p = extract_price(l.text)
+                    if p:
+                        mrp_amount = p
+                        matched_line = l
+                        if l not in all_mrp_lines:
+                            all_mrp_lines.append(l)
+                        break
+
+        # Pass E: Fallback to general price number in nearby lines
+        if not mrp_amount and candidate_indices:
+            for idx in sorted_indices:
+                l = self.ocr.lines[idx]
+                p = extract_price(l.text)
+                if p:
+                    mrp_amount = p
+                    matched_line = l
+                    if l not in all_mrp_lines:
+                        all_mrp_lines.append(l)
+                    break
 
         found = mrp_amount is not None
         avg_conf = matched_line.confidence if matched_line else (
             (sum(l.confidence for l in all_mrp_lines) / len(all_mrp_lines)) if all_mrp_lines else 0.0
         )
-
         merged_box = self._merge_boxes_from_lines(all_mrp_lines) if all_mrp_lines else (
             matched_line.box if matched_line else None
         )
@@ -305,31 +450,44 @@ class LabelFieldParser:
 
         matched_line = None
         extracted_date = None
+        matched_lines: List[OCRLine] = []
 
+        # Pass 1: Pattern on the same line
         for line in self.ocr.lines:
             m = date_pattern.search(line.text)
             if m:
-                extracted_date = m.group(1)
+                extracted_date = m.group(1).strip()
                 matched_line = line
+                matched_lines.append(line)
                 break
 
+        # Pass 2: Line has MFG/PKD keyword, date is on same or next 1-2 lines
         if not extracted_date:
-            # Look for lines mentioning MFG/PKD followed by date format
-            for line in self.ocr.lines:
-                if re.search(r"\b(mfd|mfg|pkd|packed)\b", line.text, re.IGNORECASE):
-                    m = general_date_pattern.search(line.text)
-                    if m:
-                        extracted_date = m.group(0)
-                        matched_line = line
+            for idx, line in enumerate(self.ocr.lines):
+                if re.search(r"\b(mfd|mfg|pkd|packed)\b", line.text, re.IGNORECASE) and not re.search(r"\b(by|at|ltd|pvt)\b", line.text, re.IGNORECASE):
+                    matched_lines.append(line)
+                    for off in range(3):
+                        if idx + off < len(self.ocr.lines):
+                            cand_line = self.ocr.lines[idx + off]
+                            m = general_date_pattern.search(cand_line.text)
+                            if m:
+                                extracted_date = m.group(0)
+                                matched_line = cand_line
+                                if cand_line not in matched_lines:
+                                    matched_lines.append(cand_line)
+                                break
+                    if extracted_date:
                         break
 
         found = extracted_date is not None
+        avg_conf = (sum(l.confidence for l in matched_lines) / len(matched_lines)) if matched_lines else 0.0
+
         return ExtractedField(
             field_name="manufacture_date",
             value=extracted_date,
-            raw_text=matched_line.text if matched_line else None,
-            confidence=matched_line.confidence if matched_line else 0.0,
-            bounding_box=matched_line.box if matched_line else None,
+            raw_text=" | ".join(l.text for l in matched_lines) if matched_lines else (matched_line.text if matched_line else None),
+            confidence=avg_conf,
+            bounding_box=self._merge_boxes_from_lines(matched_lines) if matched_lines else None,
             found=found,
             details={"format_valid": found}
         )
@@ -337,27 +495,58 @@ class LabelFieldParser:
     def parse_best_before(self) -> ExtractedField:
         """Parses expiry date or best before statement."""
         pattern = re.compile(
-            r"(?:best\s*before|use\s*by|exp(?:\.|\s*date)?|expiry)[:\s\.]*(.+)",
+            r"(?:best\s*before|use\s*by|exp(?:\.|\s*date|\s*d)?|expiry)[:\s\.\-]*(\b(?:0[1-9]|1[0-2])[\/\.\-](?:20\d{2}|\d{2})\b|.+)?",
             re.IGNORECASE
         )
+        date_pattern = re.compile(r"\b(0[1-9]|1[0-2])[\/\.\-](20\d{2}|\d{2})\b")
 
         matched_line = None
         extracted_val = None
+        matched_lines: List[OCRLine] = []
 
-        for line in self.ocr.lines:
+        for idx, line in enumerate(self.ocr.lines):
             m = pattern.search(line.text)
             if m:
-                extracted_val = m.group(1).strip() or line.text.strip()
+                raw_v = (m.group(1) or "").strip()
+                matched_lines.append(line)
                 matched_line = line
-                break
 
-        found = matched_line is not None
+                # Check if raw_v contains MM/YYYY date
+                dm = date_pattern.search(raw_v)
+                if dm:
+                    extracted_val = dm.group(0)
+                    break
+
+                # If raw_v is empty or just 'Date', check next line
+                if not raw_v or raw_v.lower() == "date":
+                    if idx + 1 < len(self.ocr.lines):
+                        next_line = self.ocr.lines[idx + 1]
+                        dm2 = date_pattern.search(next_line.text)
+                        if dm2:
+                            extracted_val = dm2.group(0)
+                            matched_lines.append(next_line)
+                            break
+                        # Also check duration e.g. '12 months'
+                        dur_m = re.search(r"(\d+\s*(?:months?|days?|years?)(?:\s*from\s*[a-z]+)?)", next_line.text, re.I)
+                        if dur_m:
+                            extracted_val = dur_m.group(1)
+                            matched_lines.append(next_line)
+                            break
+
+                if raw_v and raw_v.lower() != "date":
+                    clean_v = re.sub(r"^(?:date[:\s\.\-]*)", "", raw_v, flags=re.I).strip()
+                    extracted_val = clean_v or raw_v
+                    break
+
+        found = extracted_val is not None
+        avg_conf = (sum(l.confidence for l in matched_lines) / len(matched_lines)) if matched_lines else 0.0
+
         return ExtractedField(
             field_name="best_before_or_expiry_date",
             value=extracted_val,
-            raw_text=matched_line.text if matched_line else None,
-            confidence=matched_line.confidence if matched_line else 0.0,
-            bounding_box=matched_line.box if matched_line else None,
+            raw_text=" | ".join(l.text for l in matched_lines) if matched_lines else None,
+            confidence=avg_conf,
+            bounding_box=self._merge_boxes_from_lines(matched_lines) if matched_lines else None,
             found=found,
             details={}
         )

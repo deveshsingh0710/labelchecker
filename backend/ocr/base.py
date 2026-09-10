@@ -106,6 +106,6 @@ class BaseOCREngine(ABC):
     """
 
     @abstractmethod
-    def extract(self, image_path: str) -> OCRResult:
+    def extract(self, image_path: str, raw_image_path: Optional[str] = None) -> OCRResult:
         """Extract text, confidence scores, and bounding boxes from an image."""
         pass
