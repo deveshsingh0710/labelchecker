@@ -57,3 +57,44 @@ def test_field_parser_multiline_pouch():
     assert fields["best_before_or_expiry_date"].value == "03/2025"
     assert fields["manufacturer_name_and_address"].found is True
     assert "249403" in fields["manufacturer_name_and_address"].value
+
+def test_field_parser_aerosol_spray():
+    lines = [
+        OCRLine("DENVER AUTOGRAPH", 92.0, BoundingBox(10, 10, 200, 20, 500, 500)),
+        OCRLine("Hold 16 cm away from the body and spray,", 84.0, BoundingBox(10, 40, 300, 20, 500, 500)),
+        OCRLine("WARNING: Flammable, Contents under pressure, do not expose to sun OF heat", 82.0, BoundingBox(10, 70, 450, 20, 500, 500)),
+        OCRLine("MKTD BY: VANESA CARE PVT. LTD.", 92.0, BoundingBox(10, 100, 250, 20, 500, 500)),
+        OCRLine("18, G.F, Pusa Road, New Delhi-110005", 82.0, BoundingBox(10, 130, 280, 20, 500, 500)),
+        OCRLine("CONTACT CUSTOMER CARI", 94.0, BoundingBox(10, 160, 200, 20, 500, 500)),
+        OCRLine("iC No.: 1800", 73.0, BoundingBox(10, 190, 100, 20, 500, 500)),
+        OCRLine("NET CONTENTS:", 96.0, BoundingBox(10, 220, 150, 20, 500, 500)),
+        OCRLine("140 mi / 98", 85.0, BoundingBox(10, 250, 120, 20, 500, 500)),
+        OCRLine("RS.275.00", 77.0, BoundingBox(10, 280, 100, 20, 500, 500)),
+        OCRLine("08/2024", 57.0, BoundingBox(10, 310, 80, 20, 500, 500)),
+    ]
+    raw = "\n".join(l.text for l in lines)
+    ocr = OCRResult(raw, 85.0, 500, 500, lines=lines)
+    parser = LabelFieldParser(ocr)
+    fields = parser.extract_all()
+
+    # Net quantity must be dual declaration 140 ml / 98 g, NOT 16 cm
+    assert fields["net_quantity"].found is True
+    assert fields["net_quantity"].value == "140 ml / 98 g"
+    assert fields["net_quantity"].details["is_standard_unit"] is True
+
+    # Expiry must NOT match "expose to sun of heat"
+    assert fields["best_before_or_expiry_date"].value != "ose to sun OF heat"
+
+    # Manufacturer / Marketer must be found with pincode
+    assert fields["manufacturer_name_and_address"].found is True
+    assert "VANESA CARE" in fields["manufacturer_name_and_address"].value
+    assert fields["manufacturer_name_and_address"].details["has_pincode"] is True
+
+    # Customer care must capture 1800
+    assert fields["customer_care_details"].found is True
+    assert "1800" in fields["customer_care_details"].value
+
+    # MRP must be Rs 275.00
+    assert fields["mrp"].found is True
+    assert fields["mrp"].value == "₹275.00"
+

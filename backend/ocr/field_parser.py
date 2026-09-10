@@ -52,7 +52,7 @@ class LabelFieldParser:
     def parse_manufacturer(self) -> tuple[ExtractedField, Optional[ExtractedField]]:
         """Parses manufacturer and packer names/addresses."""
         mfg_pattern = re.compile(
-            r"(?:mfd|mfg|manufactured|produced)\s*(?:&|and)?\s*(?:packed\s*by|by|at)[:\s\.]+(.*)",
+            r"\b(?:mfd|mfg|mktd|marketed|manufactured|produced)\.?\s*(?:&|and)?\s*(?:packed\s*by|by|at)[:\s\.]+(.*)",
             re.IGNORECASE
         )
         pincode_pattern = re.compile(r"\b\d{6}\b")
@@ -69,7 +69,7 @@ class LabelFieldParser:
 
             if mfg_pattern.search(text):
                 capturing = True
-                clean_m = re.search(r"\b((?:mfd|mfg|manufactured|produced)\b.*)", text, re.IGNORECASE)
+                clean_m = re.search(r"\b((?:mfd|mfg|mktd|marketed|manufactured|produced)\b.*)", text, re.IGNORECASE)
                 mfg_lines.append(line)
                 mfg_text_parts.append(clean_m.group(1) if clean_m else text)
                 continue
@@ -78,7 +78,7 @@ class LabelFieldParser:
                 if re.search(r"\b(ins\s*\d+|ingredients?|flavours?|preservatives?)\b", text, re.IGNORECASE):
                     continue
                 # Stop if encountering another distinct declaration or license header
-                if re.search(r"\b(mrp|net\s*wt|pkg|pkd|customer|consumer|exp|lic|fssai|ssa)\b", text, re.IGNORECASE):
+                if re.search(r"\b(mrp|net\s*(?:wt|contents?)|pkg|pkd|customer|consumer|exp|lic|fssai|ssa)\b", text, re.IGNORECASE):
                     break
                 mfg_lines.append(line)
                 mfg_text_parts.append(text)
@@ -213,60 +213,123 @@ class LabelFieldParser:
         )
 
     def parse_net_quantity(self) -> ExtractedField:
-        """Parses net quantity value and unit."""
-        qty_pattern = re.compile(
-            r"(\d+(?:[\.,]\d+)?)\s*[\.\s]*(kg|g|gm|gms|gram|grams|ml|l|ltr|ltrs|liter|litres|litre|m|cm|mm|pieces?|pcs?|units?|N|U)\b",
+        """Parses net quantity value and unit, supporting standard and dual declarations (e.g. aerosols)."""
+        instruction_filter = re.compile(
+            r"\b(hold|away|distance|spray|shake|direction|caution|warning|inflammable|flammable|apply|avoid|eyes)\b",
             re.IGNORECASE
         )
-        net_indicator = re.compile(r"\b(net\s*(?:wt\.?|weight|qty\.?|quantity)?)\b", re.IGNORECASE)
+        net_indicator = re.compile(
+            r"\b(?:net\s*(?:contents?|vol\.?|volume|wt\.?|weight|qty\.?|quantity)?|contents?|qty\.?|quantity)\b",
+            re.IGNORECASE
+        )
+        dual_qty_pattern = re.compile(
+            r"(\d+(?:[\.,]\d+)?)\s*(ml|mi|m1|m\||rn1|l|ltr|ltrs|liter|litres|litre|g|gm|gms|gram|grams|kg|pieces?|pcs?|units?|N|U)\b\s*(?:[\/\&\|\(]\s*(\d+(?:[\.,]\d+)?)\s*(g|gm|gms|gram|grams|ml|mi|m1|m\||rn1)?)?",
+            re.IGNORECASE
+        )
 
         matched_lines: List[OCRLine] = []
         qty_value = None
         qty_unit = None
+        secondary_qty = None
+        secondary_unit = None
+        is_dual = False
         qty_line = None
+
+        def _clean_unit(u: str) -> str:
+            u_low = u.lower()
+            if u_low in ("mi", "m1", "m|", "rn1"):
+                return "ml"
+            if u_low in ("gm", "gms", "gram", "grams"):
+                return "g"
+            if u_low in ("ltr", "ltrs", "liter", "litres", "litre"):
+                return "l"
+            return u_low
 
         # Pass 1: Prioritize lines near 'Net' / 'Quantity' indicator
         for idx, line in enumerate(self.ocr.lines):
+            if instruction_filter.search(line.text) and not net_indicator.search(line.text):
+                continue
             if net_indicator.search(line.text):
                 # Check on same line
-                m = qty_pattern.search(line.text)
+                m = dual_qty_pattern.search(line.text)
+                cand_line = line
+                if not m:
+                    # Check adjacent lines (+1, +2, -1)
+                    for off in (1, 2, -1):
+                        t_idx = idx + off
+                        if 0 <= t_idx < len(self.ocr.lines):
+                            cand = self.ocr.lines[t_idx]
+                            if instruction_filter.search(cand.text):
+                                continue
+                            m2 = dual_qty_pattern.search(cand.text)
+                            if m2:
+                                m = m2
+                                cand_line = cand
+                                matched_lines = [line, cand] if off > 0 else [cand, line]
+                                break
+                else:
+                    matched_lines = [line]
+
                 if m:
                     qty_value = m.group(1).replace(",", ".")
-                    qty_unit = m.group(2).lower()
-                    qty_line = line
-                    matched_lines = [line]
-                    break
-                # Check adjacent lines (+1, +2, -1)
-                for off in (1, 2, -1):
-                    t_idx = idx + off
-                    if 0 <= t_idx < len(self.ocr.lines):
-                        cand = self.ocr.lines[t_idx]
-                        m2 = qty_pattern.search(cand.text)
-                        if m2:
-                            qty_value = m2.group(1).replace(",", ".")
-                            qty_unit = m2.group(2).lower()
-                            qty_line = cand
-                            matched_lines = [line, cand] if off > 0 else [cand, line]
-                            break
-                if qty_value:
+                    qty_unit = _clean_unit(m.group(2))
+                    qty_line = cand_line
+
+                    # Check secondary declaration (e.g. aerosol 140 ml / 98 g)
+                    val2 = m.group(3)
+                    unit2 = m.group(4)
+                    if val2:
+                        val2_clean = val2.replace(",", ".")
+                        if not unit2 and qty_unit == "ml":
+                            unit2_clean = "g"
+                        elif unit2:
+                            unit2_clean = _clean_unit(unit2)
+                        else:
+                            unit2_clean = None
+
+                        if unit2_clean:
+                            secondary_qty = val2_clean
+                            secondary_unit = unit2_clean
+                            is_dual = True
                     break
 
-        # Pass 2: Fallback to any line with standard Legal Metrology SI unit
+        # Pass 2: Fallback to lines with standard Legal Metrology SI unit
+        # Strictly ignore instruction lines and linear measurements (cm, mm, m)
         if not qty_value:
             for line in self.ocr.lines:
-                m = qty_pattern.search(line.text)
+                if instruction_filter.search(line.text):
+                    continue
+                m = dual_qty_pattern.search(line.text)
                 if m:
                     val = m.group(1).replace(",", ".")
-                    unit = m.group(2).lower()
-                    if float(val) not in (2024, 2025, 2026):
-                        qty_value = val
-                        qty_unit = unit
-                        qty_line = line
-                        matched_lines = [line]
-                        break
+                    unit = _clean_unit(m.group(2))
+                    if unit in ("cm", "mm", "m"):
+                        continue
+                    if float(val) in (2024, 2025, 2026):
+                        continue
+                    qty_value = val
+                    qty_unit = unit
+                    qty_line = line
+                    matched_lines = [line]
+
+                    val2 = m.group(3)
+                    unit2 = m.group(4)
+                    if val2:
+                        val2_clean = val2.replace(",", ".")
+                        if not unit2 and qty_unit == "ml":
+                            unit2_clean = "g"
+                        elif unit2:
+                            unit2_clean = _clean_unit(unit2)
+                        else:
+                            unit2_clean = None
+                        if unit2_clean:
+                            secondary_qty = val2_clean
+                            secondary_unit = unit2_clean
+                            is_dual = True
+                    break
 
         found = qty_value is not None
-        standard_units = {"g", "kg", "ml", "l", "m", "cm", "n", "u"}
+        standard_units = {"g", "kg", "ml", "l", "n", "u", "pcs", "pieces"}
         is_standard_unit = (qty_unit in standard_units) if qty_unit else False
 
         avg_conf = qty_line.confidence if qty_line else (
@@ -275,9 +338,14 @@ class LabelFieldParser:
         merged_box = self._merge_boxes_from_lines(matched_lines) if matched_lines else None
         raw_text_str = " ".join(l.text for l in matched_lines) if matched_lines else None
 
+        if found:
+            formatted_val = f"{qty_value} {qty_unit} / {secondary_qty} {secondary_unit}" if is_dual else f"{qty_value} {qty_unit}"
+        else:
+            formatted_val = None
+
         return ExtractedField(
             field_name="net_quantity",
-            value=f"{qty_value} {qty_unit}" if found else None,
+            value=formatted_val,
             raw_text=raw_text_str,
             confidence=avg_conf,
             bounding_box=merged_box,
@@ -285,8 +353,11 @@ class LabelFieldParser:
             details={
                 "quantity": float(qty_value) if qty_value else None,
                 "unit": qty_unit,
+                "secondary_quantity": float(secondary_qty) if secondary_qty else None,
+                "secondary_unit": secondary_unit,
                 "is_standard_unit": is_standard_unit,
-                "raw_unit": qty_unit
+                "raw_unit": qty_unit,
+                "dual_declaration": is_dual
             }
         )
 
@@ -477,6 +548,18 @@ class LabelFieldParser:
                     if extracted_date:
                         break
 
+        # Pass 3: Look for standalone MM/YYYY or MM-YYYY date (excluding expiry and license lines)
+        if not extracted_date:
+            for line in self.ocr.lines:
+                if re.search(r"\b(exp|use\s*by|best\s*before|valid|lic|no|mrp)\b", line.text, re.IGNORECASE):
+                    continue
+                m = general_date_pattern.search(line.text)
+                if m:
+                    extracted_date = m.group(0)
+                    matched_line = line
+                    matched_lines.append(line)
+                    break
+
         found = extracted_date is not None
         avg_conf = (sum(l.confidence for l in matched_lines) / len(matched_lines)) if matched_lines else 0.0
 
@@ -493,26 +576,31 @@ class LabelFieldParser:
     def parse_best_before(self) -> ExtractedField:
         """Parses expiry date or best before statement."""
         pattern = re.compile(
-            r"(?:best\s*before|use\s*by|exp(?:\.|\s*date|\s*d)?|expiry)[:\s\.\-]*(\b(?:0[1-9]|1[0-2])[\/\.\-](?:20\d{2}|\d{2})\b|.+)?",
+            r"\b(?:best\s*before|use\s*by|use\s*before|\bexp(?:\.|\s*date|\s*d)?|expiry)\b[:\s\.\-]*(\b(?:0[1-9]|1[0-2])[\/\.\-](?:20\d{2}|\d{2})\b|.+)?",
             re.IGNORECASE
         )
         date_pattern = re.compile(r"\b(0[1-9]|1[0-2])[\/\.\-](20\d{2}|\d{2})\b")
+        instruction_filter = re.compile(r"\b(hold|away|spray|shake|direction|caution|warning|inflammable|flammable|expose|heat|sun)\b", re.IGNORECASE)
 
         matched_line = None
         extracted_val = None
         matched_lines: List[OCRLine] = []
 
         for idx, line in enumerate(self.ocr.lines):
+            # Skip warning / flammability lines (e.g. 'expose to sun')
+            if instruction_filter.search(line.text) and not re.search(r"\b(best\s*before|use\s*by|use\s*before)\b", line.text, re.IGNORECASE):
+                continue
+
             m = pattern.search(line.text)
             if m:
                 raw_v = (m.group(1) or "").strip()
-                matched_lines.append(line)
-                matched_line = line
 
                 # Check if raw_v contains MM/YYYY date
                 dm = date_pattern.search(raw_v)
                 if dm:
                     extracted_val = dm.group(0)
+                    matched_lines.append(line)
+                    matched_line = line
                     break
 
                 # If raw_v is empty or just 'Date', check next line
@@ -522,18 +610,25 @@ class LabelFieldParser:
                         dm2 = date_pattern.search(next_line.text)
                         if dm2:
                             extracted_val = dm2.group(0)
-                            matched_lines.append(next_line)
+                            matched_lines.extend([line, next_line])
+                            matched_line = line
                             break
                         # Also check duration e.g. '12 months'
                         dur_m = re.search(r"(\d+\s*(?:months?|days?|years?)(?:\s*from\s*[a-z]+)?)", next_line.text, re.I)
                         if dur_m:
                             extracted_val = dur_m.group(1)
-                            matched_lines.append(next_line)
+                            matched_lines.extend([line, next_line])
+                            matched_line = line
                             break
 
                 if raw_v and raw_v.lower() != "date":
+                    # If raw_v contains safety instructions like 'sun', 'heat', ignore as false positive
+                    if re.search(r"\b(sun|heat|flame|fire|puncture|eyes|children)\b", raw_v, re.IGNORECASE):
+                        continue
                     clean_v = re.sub(r"^(?:date[:\s\.\-]*)", "", raw_v, flags=re.I).strip()
                     extracted_val = clean_v or raw_v
+                    matched_lines.append(line)
+                    matched_line = line
                     break
 
         found = extracted_val is not None
@@ -552,19 +647,22 @@ class LabelFieldParser:
     def parse_customer_care(self) -> ExtractedField:
         """Parses consumer care phone, email, and address."""
         phone_pattern = re.compile(
-            r"(?:toll[\s\-]?free|phone|tel|call|contact)[:\s\.]*([+]?[\d\s\-]{8,15})|\b1800[\s\-]?\d{3}[\s\-]?\d{3,4}\b",
+            r"(?:toll[\s\-]?free|phone|tel|call|contact|no\.?)[:\s\.]*([+]?[\d\s\-]{7,15})|\b1800[\s\-]?\d*\b",
             re.IGNORECASE
         )
         email_pattern = re.compile(r"([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+)")
-        care_keyword_pattern = re.compile(r"\b(customer\s*care|consumer\s*care|feedback|queries|complaints)\b", re.IGNORECASE)
+        care_keyword_pattern = re.compile(
+            r"\b(customer\s*car[ei]|consumer\s*car[ei]|feedback|queries|complaints|contact\s*customer)\b",
+            re.IGNORECASE
+        )
 
         phone = None
         email = None
         care_lines: List[OCRLine] = []
 
-        for line in self.ocr.lines:
+        for idx, line in enumerate(self.ocr.lines):
             t = line.text
-            has_care = care_keyword_pattern.search(t)
+            has_care = bool(care_keyword_pattern.search(t))
             m_phone = phone_pattern.search(t)
             m_email = email_pattern.search(t)
 
@@ -574,7 +672,20 @@ class LabelFieldParser:
                 email = m_email.group(1).strip()
 
             if has_care or m_phone or m_email:
-                care_lines.append(line)
+                if line not in care_lines:
+                    care_lines.append(line)
+                # Check adjacent line (+1) for toll-free number or email
+                if idx + 1 < len(self.ocr.lines):
+                    cand = self.ocr.lines[idx + 1]
+                    cand_phone = phone_pattern.search(cand.text)
+                    cand_email = email_pattern.search(cand.text)
+                    if cand_phone or cand_email or any(w in cand.text.lower() for w in ["toll", "free", "1800", "no."]):
+                        if cand not in care_lines:
+                            care_lines.append(cand)
+                        if cand_phone and not phone:
+                            phone = cand_phone.group(0).strip()
+                        if cand_email and not email:
+                            email = cand_email.group(1).strip()
 
         found = (phone is not None) or (email is not None) or (len(care_lines) > 0)
         avg_conf = (sum(l.confidence for l in care_lines) / len(care_lines)) if care_lines else 0.0
