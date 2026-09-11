@@ -87,6 +87,9 @@ class OCRResult:
     blocks: List[OCRBlock] = field(default_factory=list)
     lines: List[OCRLine] = field(default_factory=list)
     words: List[OCRWord] = field(default_factory=list)
+    low_quality_warning: bool = False
+    quality_message: Optional[str] = None
+    pass_used: str = "primary"
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -96,6 +99,9 @@ class OCRResult:
             "image_height": self.image_height,
             "total_lines": len(self.lines),
             "total_words": len(self.words),
+            "low_quality_warning": self.low_quality_warning,
+            "quality_message": self.quality_message,
+            "pass_used": self.pass_used,
         }
 
 

@@ -8,17 +8,30 @@ import { BoundingBoxOverlay } from './components/BoundingBoxOverlay';
 import { ViolationsList } from './components/ViolationsList';
 import { HistoryDashboard } from './components/HistoryDashboard';
 import { LegalGuideModal } from './components/LegalGuideModal';
-import type { PreprocessingData, VerificationResult, SampleLabel } from './types';
-import { AlertCircle, ArrowLeft } from 'lucide-react';
+import { PricingPage } from './components/PricingPage';
+import { InspectorView } from './components/InspectorView';
+import { DemoRequestModal } from './components/DemoRequestModal';
+import { AuthModal } from './components/AuthModal';
+import type { PreprocessingData, VerificationResult, SampleLabel, Organization, User } from './types';
+import { AlertCircle, ArrowLeft, Briefcase, Eye, Sparkles } from 'lucide-react';
 
 export const App: React.FC = () => {
-  const [activeTab, setActiveTab] = useState<'verifier' | 'history' | 'guide'>('verifier');
+  const [activeTab, setActiveTab] = useState<'verifier' | 'analytics' | 'pricing' | 'guide'>('verifier');
   const [step, setStep] = useState<'upload' | 'preview' | 'results'>('upload');
-  
+  const [roleView, setRoleView] = useState<'business' | 'inspector'>('business');
+
   const [samples, setSamples] = useState<SampleLabel[]>([]);
   const [preprocessingData, setPreprocessingData] = useState<PreprocessingData | null>(null);
   const [verificationResult, setVerificationResult] = useState<VerificationResult | null>(null);
-  
+
+  // Multi-tenant Organization & Auth state
+  const [demoOrgs, setDemoOrgs] = useState<Organization[]>([]);
+  const [currentOrg, setCurrentOrg] = useState<Organization | null>(null);
+  const [currentUser, setCurrentUser] = useState<User | null>(null);
+  const [isAuthModalOpen, setIsAuthModalOpen] = useState(false);
+  const [isDemoModalOpen, setIsDemoModalOpen] = useState(false);
+  const [demoPrefillType, setDemoPrefillType] = useState<string>('brand');
+
   const [highlightedRuleId, setHighlightedRuleId] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [isVerifying, setIsVerifying] = useState(false);
@@ -26,15 +39,32 @@ export const App: React.FC = () => {
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [totalAudits, setTotalAudits] = useState(0);
 
-  // Fetch sample labels and initial audit count
+  // Initial Load: Organizations, Samples, Audit Count
   useEffect(() => {
     const loadInitialData = async () => {
       try {
-        const [samplesRes, historyRes] = await Promise.all([
+        const [samplesRes, orgsRes] = await Promise.all([
           axios.get('/api/samples'),
-          axios.get('/api/verifications'),
+          axios.get('/api/organizations/demo'),
         ]);
+
         setSamples(samplesRes.data.samples || []);
+        const loadedOrgs: Organization[] = orgsRes.data.organizations || [];
+        setDemoOrgs(loadedOrgs);
+
+        // Check localStorage or default to primary brand demo org
+        const savedOrgId = localStorage.getItem('labelcheck_org_id');
+        const matchedOrg = loadedOrgs.find((o) => o.id === savedOrgId) || loadedOrgs[0] || null;
+        if (matchedOrg) {
+          setCurrentOrg(matchedOrg);
+          setCurrentUser(matchedOrg.default_user || null);
+          axios.defaults.headers.common['X-Organization-Id'] = matchedOrg.id;
+        }
+
+        // Load audit count for selected org
+        const historyRes = await axios.get('/api/verifications', {
+          headers: matchedOrg ? { 'X-Organization-Id': matchedOrg.id } : {}
+        });
         setTotalAudits((historyRes.data.verifications || []).length);
       } catch (err) {
         console.error('Error loading initial data:', err);
@@ -43,6 +73,20 @@ export const App: React.FC = () => {
     loadInitialData();
   }, []);
 
+  // Update Axios headers when organization changes
+  const handleSelectOrg = (org: Organization, user?: User, token?: string) => {
+    setCurrentOrg(org);
+    if (user) setCurrentUser(user);
+    localStorage.setItem('labelcheck_org_id', org.id);
+    if (token) localStorage.setItem('labelcheck_token', token);
+    axios.defaults.headers.common['X-Organization-Id'] = org.id;
+
+    // Refresh audit count for this organization
+    axios.get('/api/verifications', { headers: { 'X-Organization-Id': org.id } })
+      .then((res) => setTotalAudits((res.data.verifications || []).length))
+      .catch(() => {});
+  };
+
   // Step 1: Upload / select sample and trigger OpenCV preprocessing
   const handleFileSelect = async (file: File) => {
     setIsLoading(true);
@@ -50,6 +94,7 @@ export const App: React.FC = () => {
     try {
       const formData = new FormData();
       formData.append('file', file);
+      if (currentOrg) formData.append('organization_id', currentOrg.id);
       const resp = await axios.post<PreprocessingData>('/api/preprocess', formData);
       setPreprocessingData(resp.data);
       setStep('preview');
@@ -66,6 +111,7 @@ export const App: React.FC = () => {
     try {
       const formData = new FormData();
       formData.append('sample_id', sampleId);
+      if (currentOrg) formData.append('organization_id', currentOrg.id);
       const resp = await axios.post<PreprocessingData>('/api/preprocess', formData);
       setPreprocessingData(resp.data);
       setStep('preview');
@@ -84,8 +130,11 @@ export const App: React.FC = () => {
     try {
       const formData = new FormData();
       formData.append('file_id', preprocessingData.file_id);
-      const resp = await axios.post<VerificationResult>('/api/verify', formData);
-      
+      if (currentOrg) formData.append('organization_id', currentOrg.id);
+      const resp = await axios.post<VerificationResult>('/api/verify', formData, {
+        headers: currentOrg ? { 'X-Organization-Id': currentOrg.id } : {}
+      });
+
       if (resp.data.error_message && resp.data.evaluation_results.length === 0) {
         setErrorMessage(resp.data.error_message);
       } else {
@@ -147,6 +196,13 @@ export const App: React.FC = () => {
           setErrorMessage(null);
         }}
         totalAuditsCount={totalAudits}
+        activeOrg={currentOrg}
+        currentUser={currentUser}
+        onOpenOrgModal={() => setIsAuthModalOpen(true)}
+        onOpenDemoModal={() => {
+          setDemoPrefillType(currentOrg?.type || 'brand');
+          setIsDemoModalOpen(true);
+        }}
       />
 
       {/* Main Content Area */}
@@ -161,7 +217,7 @@ export const App: React.FC = () => {
             </div>
             <button
               onClick={() => setErrorMessage(null)}
-              className="text-rose-500 hover:text-rose-700 text-xs font-bold"
+              className="text-rose-500 hover:text-rose-700 text-xs font-bold cursor-pointer"
             >
               Dismiss
             </button>
@@ -175,12 +231,15 @@ export const App: React.FC = () => {
             {step === 'upload' && (
               <div className="space-y-6">
                 <div className="text-center max-w-2xl mx-auto space-y-2 mb-8">
+                  <div className="inline-flex items-center space-x-2 px-3 py-1 rounded-full bg-sky-50 border border-sky-200 text-sky-700 text-xs font-semibold mb-1">
+                    <Sparkles className="w-3.5 h-3.5" />
+                    <span>India Legal Metrology (Packaged Commodities) Rules, 2011</span>
+                  </div>
                   <h1 className="text-2xl sm:text-3xl font-black text-slate-900 tracking-tight">
-                    Verify Product Labels for Legal Metrology Compliance
+                    Verify Product Labels Before Printing or Dispatch
                   </h1>
                   <p className="text-sm text-slate-600 leading-relaxed">
-                    Upload a packaged commodity label to verify mandatory declarations against India's
-                    Legal Metrology (Packaged Commodities) Rules, 2011 with OpenCV preprocessing and OCR extraction.
+                    Upload a packaged commodity label to verify mandatory statutory declarations (MRP, Net Quantity, Expiry, Manufacturer) with OpenCV preprocessing and Tesseract OCR.
                   </p>
                 </div>
 
@@ -205,79 +264,153 @@ export const App: React.FC = () => {
               </div>
             )}
 
-            {/* Step 3: Verification Results & Interactive Overlays */}
+            {/* Step 3: Verification Results with Role-Based View Toggle */}
             {step === 'results' && verificationResult && (
               <div className="space-y-6">
-                {/* Back / Reset Bar */}
-                <div className="flex items-center justify-between">
+                {/* Control Bar: Back Button + Role-Based View Toggle (Business vs Inspector) */}
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 bg-white p-3 rounded-2xl border border-slate-200 shadow-2xs">
                   <button
                     onClick={handleReset}
-                    className="inline-flex items-center space-x-2 text-xs font-semibold text-slate-600 hover:text-slate-900 bg-white border border-slate-200 hover:bg-slate-50 px-3 py-1.5 rounded-lg transition-colors shadow-2xs"
+                    className="inline-flex items-center space-x-2 text-xs font-semibold text-slate-600 hover:text-slate-900 bg-slate-50 hover:bg-slate-100 border border-slate-200 px-3 py-1.5 rounded-xl transition-colors cursor-pointer"
                   >
                     <ArrowLeft className="w-3.5 h-3.5" />
                     <span>Check Another Label</span>
                   </button>
 
-                  <span className="text-xs font-mono text-slate-400">
+                  {/* Role-Based View Toggle */}
+                  <div className="flex items-center space-x-2 bg-slate-100 p-1 rounded-xl text-xs font-bold">
+                    <button
+                      onClick={() => setRoleView('business')}
+                      className={`px-3 py-1.5 rounded-lg transition-all flex items-center space-x-1.5 cursor-pointer ${
+                        roleView === 'business'
+                          ? 'bg-white text-slate-900 shadow-xs'
+                          : 'text-slate-600 hover:text-slate-900'
+                      }`}
+                    >
+                      <Briefcase className="w-3.5 h-3.5 text-sky-600" />
+                      <span>Business View</span>
+                    </button>
+
+                    <button
+                      onClick={() => setRoleView('inspector')}
+                      className={`px-3 py-1.5 rounded-lg transition-all flex items-center space-x-1.5 cursor-pointer ${
+                        roleView === 'inspector'
+                          ? 'bg-white text-slate-900 shadow-xs'
+                          : 'text-slate-600 hover:text-slate-900'
+                      }`}
+                    >
+                      <Eye className="w-3.5 h-3.5 text-indigo-600" />
+                      <span>Inspector Field View</span>
+                    </button>
+                  </div>
+
+                  <span className="text-xs font-mono text-slate-400 hidden lg:inline">
                     File: <span className="text-slate-700 font-semibold">{verificationResult.filename}</span>
                   </span>
                 </div>
 
-                {/* Score Banner */}
-                <ScoreBadge
-                  score={verificationResult.overall_score}
-                  status={verificationResult.compliance_status}
-                  totalPassed={verificationResult.total_passed}
-                  totalFailed={verificationResult.total_failed}
-                  totalNeedsReview={verificationResult.total_needs_review}
-                  onDownloadReport={handleDownloadReport}
-                  isDownloading={isDownloadingPdf}
-                />
-
-                {/* Grid: Visual Bounding Boxes (Left) + Rule List (Right) */}
-                <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
-                  {/* Left Column: Image with Bounding Box Overlay (5 cols) */}
-                  <div className="lg:col-span-6 sticky top-20">
-                    <BoundingBoxOverlay
-                      imageUrl={verificationResult.preprocessed_image_url || verificationResult.raw_image_url}
-                      items={verificationResult.evaluation_results}
-                      highlightedRuleId={highlightedRuleId}
-                      onSelectRule={setHighlightedRuleId}
+                {/* VIEW 1: Business View (Interactive Overlays + Checklist) */}
+                {roleView === 'business' && (
+                  <div className="space-y-6">
+                    {/* Score Banner */}
+                    <ScoreBadge
+                      score={verificationResult.overall_score}
+                      status={verificationResult.compliance_status}
+                      totalPassed={verificationResult.total_passed}
+                      totalFailed={verificationResult.total_failed}
+                      totalNeedsReview={verificationResult.total_needs_review}
+                      onDownloadReport={handleDownloadReport}
+                      isDownloading={isDownloadingPdf}
                     />
-                  </div>
 
-                  {/* Right Column: Detailed Rules Breakdown (7 cols) */}
-                  <div className="lg:col-span-6">
-                    <ViolationsList
-                      items={verificationResult.evaluation_results}
-                      highlightedRuleId={highlightedRuleId}
-                      onSelectRule={setHighlightedRuleId}
-                    />
+                    {/* Grid: Visual Bounding Boxes (Left) + Rule List (Right) */}
+                    <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
+                      {/* Left Column: Image with Bounding Box Overlay */}
+                      <div className="lg:col-span-6 sticky top-20">
+                        <BoundingBoxOverlay
+                          imageUrl={verificationResult.preprocessed_image_url || verificationResult.raw_image_url}
+                          items={verificationResult.evaluation_results}
+                          highlightedRuleId={highlightedRuleId}
+                          onSelectRule={setHighlightedRuleId}
+                        />
+                      </div>
+
+                      {/* Right Column: Detailed Rules Breakdown */}
+                      <div className="lg:col-span-6">
+                        <ViolationsList
+                          items={verificationResult.evaluation_results}
+                          highlightedRuleId={highlightedRuleId}
+                          onSelectRule={setHighlightedRuleId}
+                        />
+                      </div>
+                    </div>
                   </div>
-                </div>
+                )}
+
+                {/* VIEW 2: Inspector Field View (High-Impact Verdict + Touch Actions) */}
+                {roleView === 'inspector' && (
+                  <InspectorView
+                    result={verificationResult}
+                    onReset={handleReset}
+                    onDownloadReport={handleDownloadReport}
+                    isDownloading={isDownloadingPdf}
+                  />
+                )}
               </div>
             )}
           </div>
         )}
 
-        {/* TAB 2: AUDIT HISTORY */}
-        {activeTab === 'history' && (
-          <HistoryDashboard onInspect={handleInspectAudit} />
+        {/* TAB 2: ANALYTICS & AUDIT HISTORY */}
+        {activeTab === 'analytics' && (
+          <HistoryDashboard
+            onInspect={handleInspectAudit}
+            activeOrg={currentOrg}
+          />
         )}
 
-        {/* TAB 3: LEGAL METROLOGY GUIDE */}
+        {/* TAB 3: PRICING */}
+        {activeTab === 'pricing' && (
+          <PricingPage
+            onRequestDemo={(type) => {
+              setDemoPrefillType(type || 'brand');
+              setIsDemoModalOpen(true);
+            }}
+            onSelectStarter={() => {
+              setActiveTab('verifier');
+              setStep('upload');
+            }}
+          />
+        )}
+
+        {/* TAB 4: LEGAL RULES GUIDE */}
         {activeTab === 'guide' && (
           <LegalGuideModal />
         )}
       </main>
 
+      {/* Shared Modals */}
+      <DemoRequestModal
+        isOpen={isDemoModalOpen}
+        onClose={() => setIsDemoModalOpen(false)}
+        prefillOrgType={demoPrefillType}
+      />
+
+      <AuthModal
+        isOpen={isAuthModalOpen}
+        onClose={() => setIsAuthModalOpen(false)}
+        demoOrgs={demoOrgs}
+        currentOrg={currentOrg}
+        onSelectOrg={handleSelectOrg}
+      />
+
       {/* Footer */}
       <footer className="bg-white border-t border-slate-200 py-6 text-center text-xs text-slate-400">
         <div className="max-w-7xl mx-auto px-4 flex flex-col sm:flex-row items-center justify-between gap-2">
           <span>
-            <b>LabelCheck</b> &bull; India Legal Metrology (Packaged Commodities) Rules, 2011 Compliance Verification
+            <b>LabelCheck</b> &bull; India Legal Metrology (Packaged Commodities) Rules, 2011 Automated Verification
           </span>
-          <span>FastAPI &bull; OpenCV &bull; Tesseract OCR &bull; ReportLab &bull; React + Tailwind</span>
+          <span>FastAPI &bull; OpenCV &bull; Tesseract OCR &bull; ReportLab &bull; Recharts &bull; React + Tailwind</span>
         </div>
       </footer>
     </div>

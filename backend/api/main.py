@@ -2,13 +2,17 @@ import os
 import uuid
 import json
 import shutil
+import time
+import logging
 from pathlib import Path
 from typing import Optional, List, Dict, Any
+from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Depends
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Depends, Request, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from config import (
@@ -19,19 +23,104 @@ from config import (
     REPORTS_DIR,
     SAMPLES_DIR,
 )
-from database import get_db, init_db, Verification
+from database import (
+    get_db,
+    init_db,
+    Verification,
+    Organization,
+    User,
+    DemoRequest,
+    hash_password,
+    DEMO_ORG_BRAND_ID,
+    DEMO_ORG_GOVT_ID,
+    DEMO_ORG_MARKETPLACE_ID,
+)
 from preprocessing import ImagePreprocessor
 from ocr import TesseractOCREngine, LabelFieldParser
 from compliance import ComplianceEngine
 from reports import ComplianceReportGenerator
 
-# Initialize database tables
-init_db()
+logger = logging.getLogger("labelcheck.api")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
+
+# Shared global fallback instances
+preprocessor = ImagePreprocessor()
+ocr_engine = TesseractOCREngine()
+compliance_engine = ComplianceEngine()
+pdf_generator = ComplianceReportGenerator()
+
+
+class SignupRequest(BaseModel):
+    email: str
+    password: str
+    name: str
+    organization_name: str
+    organization_type: str = "brand"  # brand | government | marketplace | audit_firm
+
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+
+class DemoSubmission(BaseModel):
+    name: str
+    email: str
+    organization_name: str
+    organization_type: str  # brand | government | marketplace | audit_firm
+    message: Optional[str] = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    FastAPI lifespan handler: moves heavy one-time initialization
+    out of import time and provides startup timing metrics.
+    """
+    startup_start = time.perf_counter()
+    logger.info("Starting LabelCheck API...")
+
+    # 1. Database table initialization
+    t0 = time.perf_counter()
+    init_db()
+    db_time = (time.perf_counter() - t0) * 1000
+    logger.info(f"[Startup Stage 1/4] SQLite database verified in {db_time:.1f}ms")
+
+    # 2. Image Preprocessor
+    t0 = time.perf_counter()
+    app.state.preprocessor = ImagePreprocessor()
+    prep_time = (time.perf_counter() - t0) * 1000
+    logger.info(f"[Startup Stage 2/4] OpenCV preprocessor ready in {prep_time:.1f}ms")
+
+    # 3. Tesseract OCR Engine
+    t0 = time.perf_counter()
+    app.state.ocr_engine = TesseractOCREngine()
+    ocr_init_time = (time.perf_counter() - t0) * 1000
+    logger.info(f"[Startup Stage 3/4] Tesseract OCR engine initialized in {ocr_init_time:.1f}ms")
+
+    # 4. Compliance Rule Engine & PDF Generator
+    t0 = time.perf_counter()
+    app.state.compliance_engine = ComplianceEngine()
+    app.state.pdf_generator = ComplianceReportGenerator()
+    rules_time = (time.perf_counter() - t0) * 1000
+    logger.info(f"[Startup Stage 4/4] Compliance rules ({len(app.state.compliance_engine.ruleset.get('rules', []))} rules) & ReportLab ready in {rules_time:.1f}ms")
+
+    total_startup_ms = (time.perf_counter() - startup_start) * 1000
+    logger.info(f"LabelCheck backend startup successfully completed in {total_startup_ms:.1f}ms")
+
+    yield
+
+    logger.info("Shutting down LabelCheck API...")
+
 
 app = FastAPI(
     title="LabelCheck API",
     description="Legal Metrology Packaged Commodity Compliance Verification API",
-    version="1.0.0"
+    version="1.0.0",
+    lifespan=lifespan
 )
 
 # Enable CORS for React frontend
@@ -47,12 +136,6 @@ app.add_middleware(
 app.mount("/static/uploads", StaticFiles(directory=str(UPLOAD_DIR)), name="uploads")
 app.mount("/static/preprocessed", StaticFiles(directory=str(PREPROCESSED_DIR)), name="preprocessed")
 app.mount("/static/samples", StaticFiles(directory=str(SAMPLES_DIR)), name="samples")
-
-# Reusable instances
-preprocessor = ImagePreprocessor()
-ocr_engine = TesseractOCREngine()
-compliance_engine = ComplianceEngine()
-pdf_generator = ComplianceReportGenerator()
 
 
 @app.get("/api/health")
@@ -99,12 +182,14 @@ def get_sample_labels():
 @app.post("/api/preprocess")
 async def preprocess_image(
     file: Optional[UploadFile] = File(None),
-    sample_id: Optional[str] = Form(None)
+    sample_id: Optional[str] = Form(None),
+    request: Request = None
 ):
     """
     Step 1 of verification: Uploads the label and applies the OpenCV pipeline.
     Returns the preprocessed image preview and transformation metrics.
     """
+    t_start = time.perf_counter()
     file_id = str(uuid.uuid4())
     original_filename = "label.png"
 
@@ -132,20 +217,38 @@ async def preprocess_image(
     prep_filename = f"preprocessed_{file_id}.jpg"
     prep_path = PREPROCESSED_DIR / prep_filename
 
+    active_preprocessor = getattr(request.app.state, "preprocessor", preprocessor) if request else preprocessor
+
+    t_prep_start = time.perf_counter()
     try:
-        prep_result = preprocessor.process(str(raw_path), str(prep_path))
+        prep_result = active_preprocessor.process(str(raw_path), str(prep_path))
     except Exception as e:
+        logger.error(f"Image preprocessing failed for {file_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Image preprocessing failed: {str(e)}")
+    
+    prep_time_ms = round((time.perf_counter() - t_prep_start) * 1000, 1)
+    total_time_ms = round((time.perf_counter() - t_start) * 1000, 1)
+
+    logger.info(
+        f"[/api/preprocess] Completed for {original_filename} in {total_time_ms}ms "
+        f"(OpenCV pipeline: {prep_time_ms}ms, deskew: {prep_result.deskew_angle}°)"
+    )
 
     return {
         "file_id": file_id,
         "filename": original_filename,
         "raw_image_url": f"/static/uploads/{raw_path.name}",
         "preprocessed_image_url": f"/static/preprocessed/{prep_filename}",
+        "binarized_image_url": f"/static/preprocessed/{Path(prep_result.binarized_path).name}",
         "deskew_angle": prep_result.deskew_angle,
         "original_dimensions": prep_result.original_dimensions,
         "preprocessed_dimensions": prep_result.preprocessed_dimensions,
-        "metadata": prep_result.metadata
+        "metadata": prep_result.metadata,
+        "timing_ms": {
+            "pipeline_ms": prep_time_ms,
+            "total_ms": total_time_ms,
+            **prep_result.timing_ms
+        }
     }
 
 
@@ -154,32 +257,42 @@ async def verify_label(
     file_id: Optional[str] = Form(None),
     file: Optional[UploadFile] = File(None),
     sample_id: Optional[str] = Form(None),
-    db: Session = Depends(get_db)
+    organization_id: Optional[str] = Form(None),
+    x_organization_id: Optional[str] = Header(None, alias="X-Organization-Id"),
+    db: Session = Depends(get_db),
+    request: Request = None
 ):
     """
     Step 2: Runs OCR extraction and rule engine compliance evaluation.
-    Persists result in SQLite database and prepares PDF report generation.
+    Persists result in SQLite database. PDF generation remains strictly on-demand.
     """
+    t_verify_start = time.perf_counter()
+    timing: Dict[str, float] = {}
+
+    active_preprocessor = getattr(request.app.state, "preprocessor", preprocessor) if request else preprocessor
+    active_ocr = getattr(request.app.state, "ocr_engine", ocr_engine) if request else ocr_engine
+    active_compliance = getattr(request.app.state, "compliance_engine", compliance_engine) if request else compliance_engine
+
     # 1. Determine raw and preprocessed images
+    t0 = time.perf_counter()
     if file_id and isinstance(file_id, str) and file_id.strip():
-        # Match existing uploaded & preprocessed files
         matched_raw = list(UPLOAD_DIR.glob(f"{file_id}.*"))
         if not matched_raw:
             raise HTTPException(status_code=404, detail="Uploaded file session not found")
         raw_path = matched_raw[0]
         prep_path = PREPROCESSED_DIR / f"preprocessed_{file_id}.jpg"
         if not prep_path.exists():
-            preprocessor.process(str(raw_path), str(prep_path))
+            active_preprocessor.process(str(raw_path), str(prep_path))
         filename = raw_path.name
     elif sample_id and isinstance(sample_id, str) and sample_id.strip():
-        prep_resp = await preprocess_image(file=None, sample_id=sample_id)
+        prep_resp = await preprocess_image(file=None, sample_id=sample_id, request=request)
         file_id = prep_resp["file_id"]
         matched_raw = list(UPLOAD_DIR.glob(f"{file_id}.*"))
         raw_path = matched_raw[0]
         prep_path = PREPROCESSED_DIR / f"preprocessed_{file_id}.jpg"
         filename = f"{sample_id}.png"
     elif file is not None and hasattr(file, "filename") and file.filename:
-        prep_resp = await preprocess_image(file=file, sample_id=None)
+        prep_resp = await preprocess_image(file=file, sample_id=None, request=request)
         file_id = prep_resp["file_id"]
         matched_raw = list(UPLOAD_DIR.glob(f"{file_id}.*"))
         raw_path = matched_raw[0]
@@ -187,15 +300,28 @@ async def verify_label(
         filename = file.filename or "upload.jpg"
     else:
         raise HTTPException(status_code=400, detail="Must provide file_id, file, or sample_id")
+    timing["image_prep_stage_ms"] = round((time.perf_counter() - t0) * 1000, 1)
 
-    # 2. Run OCR extraction (multi-pass combining preprocessed and raw image)
+    # Locate companion binarized / grayscale files
+    binarized_path = PREPROCESSED_DIR / f"preprocessed_{file_id}_binarized.png"
+    grayscale_path = PREPROCESSED_DIR / f"preprocessed_{file_id}_grayscale.png"
+
+    # 2. Run OCR extraction (fast single primary pass with adaptive retry)
+    t0 = time.perf_counter()
     try:
-        ocr_result = ocr_engine.extract(str(prep_path), raw_image_path=str(raw_path))
+        ocr_result = active_ocr.extract(
+            str(prep_path),
+            raw_image_path=str(raw_path),
+            binarized_path=str(binarized_path) if binarized_path.exists() else None,
+            grayscale_path=str(grayscale_path) if grayscale_path.exists() else None,
+        )
     except Exception as e:
+        logger.error(f"OCR extraction failed for {file_id}: {e}")
         raise HTTPException(status_code=500, detail=f"OCR extraction failed: {str(e)}")
+    timing["ocr_stage_ms"] = round((time.perf_counter() - t0) * 1000, 1)
 
     if not ocr_result.raw_text.strip():
-        # Handle blurry / no text image gracefully
+        # Handle blank / illegible image gracefully
         return JSONResponse(
             status_code=200,
             content={
@@ -207,7 +333,9 @@ async def verify_label(
                     "raw_text": "",
                     "average_confidence": 0.0,
                     "total_words": 0,
-                    "total_lines": 0
+                    "total_lines": 0,
+                    "low_quality_warning": True,
+                    "quality_message": "Low image quality — please retake photo with better lighting and focus."
                 },
                 "overall_score": 0.0,
                 "compliance_status": "NON_COMPLIANT",
@@ -217,19 +345,25 @@ async def verify_label(
                 "extracted_fields": {},
                 "evaluation_results": [],
                 "error_message": "No readable text detected. Please ensure the label is sharp, well-lit, and not obstructed.",
-                "pdf_report_url": None
+                "quality_warning": "Low image quality — please retake photo with better lighting and focus.",
+                "pdf_report_url": None,
+                "timing_ms": timing
             }
         )
 
     # 3. Parse fields
+    t0 = time.perf_counter()
     parser = LabelFieldParser(ocr_result)
     extracted_fields_dict = parser.extract_all()
+    timing["parsing_stage_ms"] = round((time.perf_counter() - t0) * 1000, 1)
 
     # 4. Evaluate compliance rules
-    compliance_summary = compliance_engine.evaluate(
+    t0 = time.perf_counter()
+    compliance_summary = active_compliance.evaluate(
         extracted_fields_dict,
         overall_ocr_confidence=ocr_result.average_confidence
     )
+    timing["compliance_eval_stage_ms"] = round((time.perf_counter() - t0) * 1000, 1)
 
     # Serialize extracted fields and evaluation results
     serializable_fields = {k: v.to_dict() for k, v in extracted_fields_dict.items()}
@@ -239,8 +373,11 @@ async def verify_label(
     prep_url = f"/static/preprocessed/{prep_path.name}"
 
     # 5. Persist into database
+    effective_org = organization_id or x_organization_id or DEMO_ORG_BRAND_ID
+    t0 = time.perf_counter()
     verification_record = Verification(
         id=file_id,
+        organization_id=effective_org,
         filename=filename,
         original_image=raw_url,
         preprocessed_image=prep_url,
@@ -255,9 +392,21 @@ async def verify_label(
 
     db.merge(verification_record)
     db.commit()
+    timing["db_commit_stage_ms"] = round((time.perf_counter() - t0) * 1000, 1)
+
+    total_verify_ms = round((time.perf_counter() - t_verify_start) * 1000, 1)
+    timing["total_verify_ms"] = total_verify_ms
+
+    logger.info(
+        f"[/api/verify] Completed for {filename} (org: {effective_org}) in {total_verify_ms}ms: "
+        f"Prep={timing['image_prep_stage_ms']}ms, OCR={timing['ocr_stage_ms']}ms, "
+        f"Parse={timing['parsing_stage_ms']}ms, Eval={timing['compliance_eval_stage_ms']}ms, "
+        f"Score={compliance_summary.overall_score:.1f}, Conf={ocr_result.average_confidence:.1f}%"
+    )
 
     return {
         "id": file_id,
+        "organization_id": effective_org,
         "filename": filename,
         "raw_image_url": raw_url,
         "preprocessed_image_url": prep_url,
@@ -269,14 +418,25 @@ async def verify_label(
         "total_needs_review": compliance_summary.total_needs_review,
         "extracted_fields": serializable_fields,
         "evaluation_results": serializable_eval,
-        "pdf_report_url": f"/api/verifications/{file_id}/pdf"
+        "quality_warning": ocr_result.quality_message if ocr_result.low_quality_warning else None,
+        "pdf_report_url": f"/api/verifications/{file_id}/pdf",
+        "timing_ms": timing
     }
 
 
 @app.get("/api/verifications")
-def list_verifications(limit: int = 20, db: Session = Depends(get_db)):
-    """Returns historical label verification audits."""
-    records = db.query(Verification).order_by(Verification.created_at.desc()).limit(limit).all()
+def list_verifications(
+    organization_id: Optional[str] = None,
+    x_organization_id: Optional[str] = Header(None, alias="X-Organization-Id"),
+    limit: int = 50,
+    db: Session = Depends(get_db)
+):
+    """Returns historical label verification audits, optionally scoped to an organization."""
+    effective_org = organization_id or x_organization_id
+    query = db.query(Verification)
+    if effective_org and effective_org.strip() and effective_org != "all":
+        query = query.filter(Verification.organization_id == effective_org.strip())
+    records = query.order_by(Verification.created_at.desc()).limit(limit).all()
     return {"verifications": [r.to_dict() for r in records]}
 
 
@@ -292,8 +452,12 @@ def get_verification(v_id: str, db: Session = Depends(get_db)):
 
 
 @app.get("/api/verifications/{v_id}/pdf")
-def download_pdf_report(v_id: str, db: Session = Depends(get_db)):
-    """Generates on-the-fly or returns existing PDF report for the verification."""
+def download_pdf_report(v_id: str, db: Session = Depends(get_db), request: Request = None):
+    """
+    Generates on-the-fly or returns existing PDF report for the verification.
+    Guaranteed on-demand execution with latency logging.
+    """
+    t0 = time.perf_counter()
     record = db.query(Verification).filter(Verification.id == v_id).first()
     if not record:
         raise HTTPException(status_code=404, detail="Verification record not found")
@@ -303,7 +467,6 @@ def download_pdf_report(v_id: str, db: Session = Depends(get_db)):
 
     # If not already generated, generate now
     if not pdf_path.exists():
-        # Find preprocessed or raw image
         prep_path = PREPROCESSED_DIR / f"preprocessed_{v_id}.jpg"
         if not prep_path.exists():
             matched = list(UPLOAD_DIR.glob(f"{v_id}.*"))
@@ -314,7 +477,12 @@ def download_pdf_report(v_id: str, db: Session = Depends(get_db)):
         if not img_source or not os.path.exists(img_source):
             raise HTTPException(status_code=404, detail="Source image not found to build report")
 
-        pdf_generator.generate(record.to_dict(), img_source, output_filename=pdf_filename)
+        active_pdf_gen = getattr(request.app.state, "pdf_generator", pdf_generator) if request else pdf_generator
+        active_pdf_gen.generate(record.to_dict(), img_source, output_filename=pdf_filename)
+        elapsed_pdf = round((time.perf_counter() - t0) * 1000, 1)
+        logger.info(f"[/api/verifications/{v_id}/pdf] Generated ReportLab PDF in {elapsed_pdf}ms")
+    else:
+        logger.info(f"[/api/verifications/{v_id}/pdf] Returning existing cached PDF for {v_id}")
 
     return FileResponse(
         path=str(pdf_path),
@@ -324,6 +492,200 @@ def download_pdf_report(v_id: str, db: Session = Depends(get_db)):
     )
 
 
+@app.get("/api/analytics")
+def get_analytics(
+    organization_id: Optional[str] = None,
+    x_organization_id: Optional[str] = Header(None, alias="X-Organization-Id"),
+    db: Session = Depends(get_db)
+):
+    """Calculates aggregated compliance rates, score averages, and violation frequencies."""
+    effective_org = organization_id or x_organization_id
+    query = db.query(Verification)
+    if effective_org and effective_org.strip() and effective_org != "all":
+        query = query.filter(Verification.organization_id == effective_org.strip())
+    records = query.all()
+
+    total_scans = len(records)
+    if total_scans == 0:
+        return {
+            "total_scans": 0,
+            "compliant_count": 0,
+            "partially_compliant_count": 0,
+            "non_compliant_count": 0,
+            "compliance_rate": 0.0,
+            "average_score": 0.0,
+            "top_violations": [],
+            "status_breakdown": [
+                {"name": "Compliant", "value": 0, "color": "#10B981"},
+                {"name": "Partially Compliant", "value": 0, "color": "#F59E0B"},
+                {"name": "Non-Compliant", "value": 0, "color": "#F43F5E"},
+            ]
+        }
+
+    comp_count = sum(1 for r in records if r.compliance_status == "COMPLIANT")
+    part_count = sum(1 for r in records if r.compliance_status == "PARTIALLY_COMPLIANT")
+    non_comp_count = sum(1 for r in records if r.compliance_status == "NON_COMPLIANT")
+    avg_score = round(sum(r.overall_score for r in records) / total_scans, 1)
+    comp_rate = round((comp_count / total_scans) * 100.0, 1)
+
+    # Aggregate violations across all scans
+    violation_counts: Dict[str, Dict[str, Any]] = {}
+    for r in records:
+        try:
+            eval_items = json.loads(r.evaluation_results) if r.evaluation_results else []
+            for ev in eval_items:
+                if ev.get("status") in ("FAIL", "NEEDS_REVIEW"):
+                    rule_id = ev.get("rule_id", "unknown_rule")
+                    rule_name = ev.get("rule_name", rule_id.replace("_", " ").title())
+                    legal_ref = ev.get("legal_reference", "Legal Metrology 2011")
+                    if rule_id not in violation_counts:
+                        violation_counts[rule_id] = {
+                            "rule_id": rule_id,
+                            "rule_name": rule_name,
+                            "legal_reference": legal_ref,
+                            "count": 0,
+                        }
+                    violation_counts[rule_id]["count"] += 1
+        except Exception:
+            continue
+
+    sorted_violations = sorted(
+        violation_counts.values(),
+        key=lambda x: x["count"],
+        reverse=True
+    )[:8]
+
+    for v in sorted_violations:
+        v["percentage"] = round((v["count"] / total_scans) * 100.0, 1)
+
+    return {
+        "total_scans": total_scans,
+        "compliant_count": comp_count,
+        "partially_compliant_count": part_count,
+        "non_compliant_count": non_comp_count,
+        "compliance_rate": comp_rate,
+        "average_score": avg_score,
+        "top_violations": sorted_violations,
+        "status_breakdown": [
+            {"name": "Compliant", "value": comp_count, "color": "#10B981"},
+            {"name": "Partially Compliant", "value": part_count, "color": "#F59E0B"},
+            {"name": "Non-Compliant", "value": non_comp_count, "color": "#F43F5E"},
+        ]
+    }
+
+
+@app.get("/api/organizations/demo")
+def get_demo_organizations(db: Session = Depends(get_db)):
+    """Returns seeded demo organizations for quick 1-click tenant switching in hackathon demo."""
+    orgs = db.query(Organization).all()
+    out = []
+    for org in orgs:
+        d = org.to_dict()
+        user = db.query(User).filter(User.organization_id == org.id).first()
+        d["default_user"] = user.to_dict() if user else None
+        out.append(d)
+    return {"organizations": out}
+
+
+@app.post("/api/auth/signup")
+def signup(req: SignupRequest, db: Session = Depends(get_db)):
+    """Registers a new user and organization."""
+    existing = db.query(User).filter(User.email == req.email.strip().lower()).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="User with this email already exists")
+
+    new_org = Organization(
+        id=str(uuid.uuid4()),
+        name=req.organization_name.strip(),
+        type=req.organization_type.strip().lower()
+    )
+    db.add(new_org)
+    db.flush()
+
+    new_user = User(
+        id=str(uuid.uuid4()),
+        email=req.email.strip().lower(),
+        password_hash=hash_password(req.password),
+        name=req.name.strip(),
+        organization_id=new_org.id,
+        role="admin"
+    )
+    db.add(new_user)
+    db.commit()
+
+    return {
+        "status": "success",
+        "token": f"token-{new_user.id}",
+        "user": new_user.to_dict(),
+        "organization": new_org.to_dict()
+    }
+
+
+@app.post("/api/auth/login")
+def login(req: LoginRequest, db: Session = Depends(get_db)):
+    """Authenticates credentials and returns user and organization profile."""
+    user = db.query(User).filter(User.email == req.email.strip().lower()).first()
+    if not user or user.password_hash != hash_password(req.password):
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+
+    org = db.query(Organization).filter(Organization.id == user.organization_id).first()
+    return {
+        "status": "success",
+        "token": f"token-{user.id}",
+        "user": user.to_dict(),
+        "organization": org.to_dict() if org else None
+    }
+
+
+@app.get("/api/auth/me")
+def get_current_user(
+    authorization: Optional[str] = Header(None),
+    x_organization_id: Optional[str] = Header(None, alias="X-Organization-Id"),
+    db: Session = Depends(get_db)
+):
+    """Returns current active user / organization context."""
+    if authorization and "token-" in authorization:
+        user_id = authorization.replace("Bearer ", "").replace("token-", "").strip()
+        user = db.query(User).filter(User.id == user_id).first()
+        if user:
+            org = db.query(Organization).filter(Organization.id == user.organization_id).first()
+            return {"user": user.to_dict(), "organization": org.to_dict() if org else None}
+
+    # Fallback to demo org
+    org_id = x_organization_id or DEMO_ORG_BRAND_ID
+    org = db.query(Organization).filter(Organization.id == org_id).first()
+    user = db.query(User).filter(User.organization_id == org_id).first() if org else None
+    return {
+        "user": user.to_dict() if user else None,
+        "organization": org.to_dict() if org else None
+    }
+
+
+@app.post("/api/demo-request")
+def submit_demo_request(req: DemoSubmission, db: Session = Depends(get_db)):
+    """Stores inbound enterprise/government demo requests in database."""
+    if not req.name.strip() or not req.email.strip() or not req.organization_name.strip():
+        raise HTTPException(status_code=400, detail="Name, email, and organization name are required")
+
+    demo = DemoRequest(
+        id=str(uuid.uuid4()),
+        name=req.name.strip(),
+        email=req.email.strip().lower(),
+        organization_name=req.organization_name.strip(),
+        organization_type=req.organization_type.strip(),
+        message=req.message.strip() if req.message else None,
+        status="pending"
+    )
+    db.add(demo)
+    db.commit()
+
+    return {
+        "status": "success",
+        "request_id": demo.id,
+        "message": "Thank you! Your demo request has been received. Our compliance advisory team will reach out within 24 hours."
+    }
+
+
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    uvicorn.run(app, host="127.0.0.1", port=8001)

@@ -82,3 +82,48 @@ export interface SampleLabel {
   image_url: string;
   expected_status: string;
 }
+
+export interface Organization {
+  id: string;
+  name: string;
+  type: 'brand' | 'government' | 'marketplace' | 'audit_firm';
+  created_at?: string;
+  default_user?: User;
+}
+
+export interface User {
+  id: string;
+  email: string;
+  name: string;
+  organization_id: string;
+  organization_name?: string;
+  organization_type?: string;
+  role: string;
+}
+
+export interface TopViolation {
+  rule_id: string;
+  rule_name: string;
+  legal_reference: string;
+  count: number;
+  percentage: number;
+}
+
+export interface AnalyticsData {
+  total_scans: number;
+  compliant_count: number;
+  partially_compliant_count: number;
+  non_compliant_count: number;
+  compliance_rate: number;
+  average_score: number;
+  top_violations: TopViolation[];
+  status_breakdown: { name: string; value: number; color: string }[];
+}
+
+export interface DemoRequestForm {
+  name: string;
+  email: string;
+  organization_name: string;
+  organization_type: string;
+  message?: string;
+}

@@ -2,7 +2,7 @@
 title Push LabelCheck to GitHub
 echo ===================================================
 echo Pushing LabelCheck to GitHub:
-echo https://github.com/deveshsingh0710/labelcheck.git
+echo https://github.com/deveshsingh0710/labelchecker.git
 echo ===================================================
 echo.
 cd /d "%~dp0"

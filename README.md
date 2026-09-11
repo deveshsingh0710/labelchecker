@@ -173,9 +173,9 @@ Complaince Checker/
 
 5. Start the FastAPI server:
    ```bash
-   python -m uvicorn api.main:app --host 127.0.0.1 --port 8000 --reload
+   python -m uvicorn api.main:app --host 127.0.0.1 --port 8001 --reload
    ```
-   The backend API will be available at `http://127.0.0.1:8000`. Interactive Swagger documentation is at `http://127.0.0.1:8000/docs`.
+   The backend API will be available at `http://127.0.0.1:8001`. Interactive Swagger documentation is at `http://127.0.0.1:8001/docs`.
 
 ---
 
@@ -195,13 +195,13 @@ Complaince Checker/
    ```bash
    npm run dev
    ```
-   The application will be live at `http://localhost:5173`.
+   The application will be live at `http://localhost:3000`.
 
 ---
 
 ## How to Test the Application
 
-1. Open `http://localhost:5173` in your browser.
+1. Open `http://localhost:3000` in your browser.
 2. In the **Verifier** tab:
    - Click one of the pre-built sample labels (e.g. **Test Compliant Label** or **Test Violations Label**).
    - Alternatively, drag and drop any image of a packaged commodity product.

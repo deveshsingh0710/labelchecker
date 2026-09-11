@@ -52,7 +52,7 @@ class LabelFieldParser:
     def parse_manufacturer(self) -> tuple[ExtractedField, Optional[ExtractedField]]:
         """Parses manufacturer and packer names/addresses."""
         mfg_pattern = re.compile(
-            r"\b(?:mfd|mfg|mktd|marketed|manufactured|produced)\.?\s*(?:&|and)?\s*(?:packed\s*by|by|at)[:\s\.]+(.*)",
+            r"\b(?:mfd|mfg|mktd|marketed|manufactured|manulactured|manutactured|produced)\.?\s*(?:&|and)?\s*(?:packed\s*by|by|at)[:\s\.]+(.*)",
             re.IGNORECASE
         )
         pincode_pattern = re.compile(r"\b\d{6}\b")
@@ -219,7 +219,7 @@ class LabelFieldParser:
             re.IGNORECASE
         )
         net_indicator = re.compile(
-            r"\b(?:net\s*(?:contents?|vol\.?|volume|wt\.?|weight|qty\.?|quantity)?|contents?|qty\.?|quantity)\b",
+            r"\b(?:net[\s\-_]*(?:contents?|vol\.?|volume|wt\.?|weight|qty\.?|quantity)?|contents?|qty\.?|quantity)\b",
             re.IGNORECASE
         )
         dual_qty_pattern = re.compile(
@@ -394,9 +394,14 @@ class LabelFieldParser:
             # Remove date patterns (04/2024) and quantities (5g, 250g)
             cleaned = re.sub(r"\b\d{1,2}[\/\.-]\d{2,4}\b", "", text)
             cleaned = re.sub(r"\b\d+(?:\.\d+)?\s*(?:g|gm|gms|kg|ml|l|ltr|pcs|pieces|m|cm)\b", "", cleaned, flags=re.I)
+            # Check standard decimal format or whole number
             m = re.search(r"(?:rs\.?|₹|inr)?\s*(\d+(?:[\.,]\d{1,2})?)\b", cleaned, re.I)
             if m:
                 val = m.group(1).replace(",", ".")
+                # Also check if OCR separated paise with a space e.g. '350 00'
+                m_spaced = re.search(r"(?:rs\.?|₹|inr)?\s*(\d{1,5})\s+(\d{2})\b", cleaned, re.I)
+                if m_spaced:
+                    val = f"{m_spaced.group(1)}.{m_spaced.group(2)}"
                 num = float(val)
                 if 0.5 <= num <= 50000 and num not in (2024, 2025, 2026):
                     return val
@@ -509,12 +514,13 @@ class LabelFieldParser:
 
     def parse_manufacture_date(self) -> ExtractedField:
         """Parses month and year of manufacture/packing."""
+        months_regex = r"(?:0[1-9]|1[0-2]|Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)"
         date_pattern = re.compile(
-            r"(?:mfd|mfg|pkd|packed|date\s*of\s*mfg)[:\s\.]*(\b(?:0[1-9]|1[0-2]|[A-Za-z]{3,9})[\/\.\-\s]+(?:\d{4}|\d{2})\b)",
+            rf"(?:(?:mfg|mfd|mig|pkd|packed)\.?\s*(?:date|dt|\.)?|date\s*of\s*(?:mfg|import|pkd|packing|packaging)|oate\s*of\s*import)[:\s\.\-]*(\b{months_regex}[\/\.\-\s:]+(?:\d{4}|\d{2})\b)",
             re.IGNORECASE
         )
         general_date_pattern = re.compile(
-            r"\b(0[1-9]|1[0-2])[\/\.\-](20\d{2}|\d{2})\b"
+            r"\b(0[1-9]|1[0-2])[\/\.\-\s:](20\d{2}|\d{2})\b"
         )
 
         matched_line = None
@@ -561,6 +567,12 @@ class LabelFieldParser:
                     break
 
         found = extracted_date is not None
+        if extracted_date:
+            # Normalize separators (e.g. 09:2026, 09-2026, 09.2026) to standard MM/YYYY
+            if re.match(r"^\d{1,2}[\/\.\-\s:]\d{2,4}$", extracted_date):
+                parts = re.split(r"[\/\.\-\s:]+", extracted_date)
+                if len(parts) == 2:
+                    extracted_date = f"{parts[0].zfill(2)}/{parts[1]}"
         avg_conf = (sum(l.confidence for l in matched_lines) / len(matched_lines)) if matched_lines else 0.0
 
         return ExtractedField(
