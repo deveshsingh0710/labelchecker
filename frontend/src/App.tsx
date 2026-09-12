@@ -105,7 +105,11 @@ export const App: React.FC = () => {
       setPreprocessingData(resp.data);
       setStep('preview');
     } catch (err: any) {
-      setErrorMessage(err.response?.data?.detail || 'Failed to upload and preprocess image.');
+      console.error('Preprocessing failed:', err);
+      const serverDetail = err.response?.data?.detail;
+      const statusText = err.response?.status ? `HTTP ${err.response.status} ${err.response.statusText || ''}`.trim() : null;
+      const netMsg = err.message ? `${err.message}${!API_BASE_URL ? ' (VITE_API_BASE_URL is not configured)' : ` (connected to ${API_BASE_URL})`}` : null;
+      setErrorMessage(serverDetail || statusText || netMsg || 'Failed to upload and preprocess image.');
     } finally {
       setIsLoading(false);
     }
@@ -122,7 +126,11 @@ export const App: React.FC = () => {
       setPreprocessingData(resp.data);
       setStep('preview');
     } catch (err: any) {
-      setErrorMessage(err.response?.data?.detail || 'Failed to load sample label.');
+      console.error('Sample loading failed:', err);
+      const serverDetail = err.response?.data?.detail;
+      const statusText = err.response?.status ? `HTTP ${err.response.status} ${err.response.statusText || ''}`.trim() : null;
+      const netMsg = err.message ? `${err.message}${!API_BASE_URL ? ' (VITE_API_BASE_URL is not configured)' : ` (connected to ${API_BASE_URL})`}` : null;
+      setErrorMessage(serverDetail || statusText || netMsg || 'Failed to load sample label.');
     } finally {
       setIsLoading(false);
     }
@@ -149,7 +157,11 @@ export const App: React.FC = () => {
         setTotalAudits((prev) => prev + 1);
       }
     } catch (err: any) {
-      setErrorMessage(err.response?.data?.detail || 'Verification analysis failed.');
+      console.error('Verification analysis failed:', err);
+      const serverDetail = err.response?.data?.detail;
+      const statusText = err.response?.status ? `HTTP ${err.response.status} ${err.response.statusText || ''}`.trim() : null;
+      const netMsg = err.message ? `${err.message}${!API_BASE_URL ? ' (VITE_API_BASE_URL is not configured)' : ` (connected to ${API_BASE_URL})`}` : null;
+      setErrorMessage(serverDetail || statusText || netMsg || 'Verification analysis failed.');
     } finally {
       setIsVerifying(false);
     }
