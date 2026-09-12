@@ -63,6 +63,15 @@ export interface VerificationResult {
   error_message?: string;
 }
 
+export interface VerifyJobStatus {
+  status: 'PROCESSING' | 'COMPLETED' | 'FAILED';
+  progress: number;
+  phase: string;
+  result?: VerificationResult | null;
+  error?: string | null;
+  file_id: string;
+}
+
 export interface PreprocessingData {
   file_id: string;
   filename: string;

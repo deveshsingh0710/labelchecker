@@ -12,7 +12,7 @@ import { PricingPage } from './components/PricingPage';
 import { InspectorView } from './components/InspectorView';
 import { DemoRequestModal } from './components/DemoRequestModal';
 import { AuthModal } from './components/AuthModal';
-import type { PreprocessingData, VerificationResult, SampleLabel, Organization, User } from './types';
+import type { PreprocessingData, VerificationResult, SampleLabel, Organization, User, VerifyJobStatus } from './types';
 import { AlertCircle, ArrowLeft, Briefcase, Eye, Sparkles } from 'lucide-react';
 import { API_BASE_URL, getAssetUrl } from './config';
 
@@ -41,6 +41,8 @@ export const App: React.FC = () => {
   const [highlightedRuleId, setHighlightedRuleId] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [isVerifying, setIsVerifying] = useState(false);
+  const [verifyProgress, setVerifyProgress] = useState(20);
+  const [verifyPhase, setVerifyPhase] = useState('Isolating label region & preprocessing...');
   const [isDownloadingPdf, setIsDownloadingPdf] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [totalAudits, setTotalAudits] = useState(0);
@@ -136,25 +138,78 @@ export const App: React.FC = () => {
     }
   };
 
-  // Step 2: Trigger OCR extraction and rule compliance evaluation
+  // Step 2: Trigger OCR extraction and rule compliance evaluation with async polling
   const handleVerify = async () => {
     if (!preprocessingData) return;
     setIsVerifying(true);
+    setVerifyProgress(20);
+    setVerifyPhase('Isolating label region & preprocessing...');
     setErrorMessage(null);
+
     try {
       const formData = new FormData();
       formData.append('file_id', preprocessingData.file_id);
       if (currentOrg) formData.append('organization_id', currentOrg.id);
-      const resp = await axios.post<VerificationResult>('/api/verify', formData, {
+
+      const postResp = await axios.post<any>('/api/verify', formData, {
         headers: currentOrg ? { 'X-Organization-Id': currentOrg.id } : {}
       });
 
-      if (resp.data.error_message && resp.data.evaluation_results.length === 0) {
-        setErrorMessage(resp.data.error_message);
-      } else {
-        setVerificationResult(resp.data);
-        setStep('results');
-        setTotalAudits((prev) => prev + 1);
+      // Case 1: Synchronous response (HTTP 200 with result payload)
+      if (postResp.status === 200 && postResp.data?.overall_score !== undefined) {
+        const result = postResp.data as VerificationResult;
+        if (result.error_message && (!result.evaluation_results || result.evaluation_results.length === 0)) {
+          setErrorMessage(result.error_message);
+        } else {
+          setVerificationResult(result);
+          setStep('results');
+          setTotalAudits((prev) => prev + 1);
+        }
+        setIsVerifying(false);
+        return;
+      }
+
+      // Case 2: Asynchronous background processing (HTTP 202) -> Poll GET /api/verify/status/{file_id}
+      const fileId = postResp.data?.file_id || preprocessingData.file_id;
+      let isComplete = false;
+      let attempts = 0;
+      const maxAttempts = 60; // 60 * 1200ms = 72s max wait
+
+      while (!isComplete && attempts < maxAttempts) {
+        await new Promise((resolve) => setTimeout(resolve, 1200));
+        attempts += 1;
+
+        try {
+          const statusResp = await axios.get<VerifyJobStatus>(`/api/verify/status/${fileId}`);
+          const job = statusResp.data;
+
+          if (job.progress) setVerifyProgress(job.progress);
+          if (job.phase) setVerifyPhase(job.phase);
+
+          if (job.status === 'COMPLETED' && job.result) {
+            isComplete = true;
+            const finalResult = job.result;
+            if (finalResult.error_message && (!finalResult.evaluation_results || finalResult.evaluation_results.length === 0)) {
+              setErrorMessage(finalResult.error_message);
+            } else {
+              setVerificationResult(finalResult);
+              setStep('results');
+              setTotalAudits((prev) => prev + 1);
+            }
+            break;
+          } else if (job.status === 'FAILED') {
+            throw new Error(job.error || 'Verification analysis failed in background worker.');
+          }
+        } catch (pollErr: any) {
+          if (pollErr.response?.status === 404 && attempts < 4) {
+            continue; // Job still initializing
+          }
+          throw pollErr;
+        }
+      }
+
+      if (!isComplete) {
+        throw new Error('Verification timed out after 70 seconds. Please retry with a clearer photo.');
       }
     } catch (err: any) {
       console.error('Verification analysis failed:', err);
@@ -278,6 +333,8 @@ export const App: React.FC = () => {
                   onVerify={handleVerify}
                   onReset={handleReset}
                   isVerifying={isVerifying}
+                  verifyProgress={verifyProgress}
+                  verifyPhase={verifyPhase}
                 />
               </div>
             )}

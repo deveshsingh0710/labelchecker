@@ -8,6 +8,8 @@ interface PreprocessingPreviewProps {
   onVerify: () => void;
   onReset: () => void;
   isVerifying: boolean;
+  verifyProgress?: number;
+  verifyPhase?: string;
 }
 
 export const PreprocessingPreview: React.FC<PreprocessingPreviewProps> = ({
@@ -15,6 +17,8 @@ export const PreprocessingPreview: React.FC<PreprocessingPreviewProps> = ({
   onVerify,
   onReset,
   isVerifying,
+  verifyProgress = 0,
+  verifyPhase = '',
 }) => {
   const [activeView, setActiveView] = useState<'preprocessed' | 'raw' | 'split'>('preprocessed');
 
@@ -101,7 +105,17 @@ export const PreprocessingPreview: React.FC<PreprocessingPreviewProps> = ({
       </div>
 
       {/* Preprocessing Diagnostics & Pipeline Details */}
-      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 bg-slate-50 p-4 rounded-xl border border-slate-200/80 text-xs">
+      <div className="grid grid-cols-2 sm:grid-cols-5 gap-3 bg-slate-50 p-4 rounded-xl border border-slate-200/80 text-xs">
+        <div className="space-y-0.5">
+          <span className="text-slate-400 font-medium">Label Region</span>
+          <p className="font-semibold text-slate-800 flex items-center space-x-1">
+            {data.metadata?.is_cropped ? (
+              <span className="text-emerald-700 font-bold">Isolated (Cropped)</span>
+            ) : (
+              <span>Full Frame</span>
+            )}
+          </p>
+        </div>
         <div className="space-y-0.5">
           <span className="text-slate-400 font-medium">Deskew Correction</span>
           <p className="font-semibold text-slate-800">
@@ -110,19 +124,56 @@ export const PreprocessingPreview: React.FC<PreprocessingPreviewProps> = ({
         </div>
         <div className="space-y-0.5">
           <span className="text-slate-400 font-medium">Glare Equalization</span>
-          <p className="font-semibold text-slate-800">CLAHE (LAB Channel)</p>
+          <p className="font-semibold text-slate-800">CLAHE (LAB)</p>
         </div>
         <div className="space-y-0.5">
           <span className="text-slate-400 font-medium">Denoising</span>
           <p className="font-semibold text-slate-800">Bilateral Filter</p>
         </div>
         <div className="space-y-0.5">
-          <span className="text-slate-400 font-medium">Image Resolution</span>
+          <span className="text-slate-400 font-medium">Resolution</span>
           <p className="font-semibold text-slate-800">
             {data.preprocessed_dimensions[0]} &times; {data.preprocessed_dimensions[1]} px
           </p>
         </div>
       </div>
+
+      {/* Live Verification Progress Indicator */}
+      {isVerifying && (
+        <div className="bg-sky-50 border border-sky-200 rounded-xl p-4 space-y-2.5 transition-all">
+          <div className="flex items-center justify-between text-xs">
+            <div className="flex items-center space-x-2">
+              <div className="w-3.5 h-3.5 border-2 border-sky-600 border-t-transparent rounded-full animate-spin" />
+              <span className="font-bold text-sky-950">
+                {verifyPhase || 'Processing verification analysis...'}
+              </span>
+            </div>
+            <span className="font-mono font-bold text-sky-700 text-sm">{verifyProgress || 20}%</span>
+          </div>
+
+          <div className="w-full bg-sky-200/60 rounded-full h-2.5 overflow-hidden">
+            <div
+              className="bg-gradient-to-r from-sky-500 to-indigo-600 h-2.5 rounded-full transition-all duration-300 ease-out"
+              style={{ width: `${Math.max(15, Math.min(100, verifyProgress || 20))}%` }}
+            />
+          </div>
+
+          <div className="flex justify-between text-[11px] text-slate-500">
+            <span className={verifyProgress >= 20 ? "font-semibold text-sky-700" : ""}>
+              1. Region Crop & Prep
+            </span>
+            <span className={verifyProgress >= 60 ? "font-semibold text-sky-700" : ""}>
+              2. Tesseract OCR
+            </span>
+            <span className={verifyProgress >= 80 ? "font-semibold text-sky-700" : ""}>
+              3. Field Parsing
+            </span>
+            <span className={verifyProgress >= 90 ? "font-semibold text-sky-700" : ""}>
+              4. Rule 6 Evaluation
+            </span>
+          </div>
+        </div>
+      )}
 
       {/* Action Footer */}
       <div className="flex flex-col sm:flex-row items-center justify-between gap-3 pt-2">

@@ -15,6 +15,7 @@ from config import (
     TESSERACT_EXTRA_CONFIG,
     OCR_CONFIDENCE_THRESHOLD,
     LOW_QUALITY_THRESHOLD,
+    MAX_IMAGE_DIMENSION,
 )
 from .base import BaseOCREngine, OCRResult, OCRBlock, OCRLine, OCRWord, BoundingBox
 
@@ -177,6 +178,14 @@ class TesseractOCREngine(BaseOCREngine):
         primary_img = Image.open(primary_target_path)
         img_w, img_h = primary_img.size
 
+        # Cap maximum image dimension to MAX_IMAGE_DIMENSION to avoid CPU starvation on cloud hosts
+        if max(img_w, img_h) > MAX_IMAGE_DIMENSION:
+            scale = MAX_IMAGE_DIMENSION / float(max(img_w, img_h))
+            new_size = (int(round(img_w * scale)), int(round(img_h * scale)))
+            primary_img = primary_img.resize(new_size, Image.Resampling.BILINEAR)
+            img_w, img_h = new_size
+            logger.info(f"Capped primary OCR image dimension to {new_size}")
+
         # Primary pass config with DAWG hallucination suppression
         extra = f" {TESSERACT_EXTRA_CONFIG}".strip() if TESSERACT_EXTRA_CONFIG else ""
         primary_cfg = f"--oem {self.oem} --psm {self.primary_psm} {extra}".strip()
@@ -197,6 +206,40 @@ class TesseractOCREngine(BaseOCREngine):
             logger.debug(f"Word confidence range: min={conf_min:.1f}%, max={conf_max:.1f}%")
             logger.debug(f"Raw OCR text preview:\n{raw_text_preview[:400]}")
 
+        # Fast Early-Exit: If first pass confidence is extremely low (<15%) or 0 words found:
+        # Avoid wasting CPU running all remaining multi-pass variants sequentially.
+        # Skip straight to trying the cleaned binarized variant; if still empty/illegible, exit immediately.
+        is_severely_low = (avg_conf < 15.0) or (len(words) == 0)
+        if is_severely_low:
+            logger.info(
+                f"Severe low quality detected on primary pass (conf={avg_conf:.1f}%, words={len(words)}). "
+                f"Executing fast early-exit: attempting only cleaned binarized variant."
+            )
+            if binarized_path and os.path.exists(binarized_path) and binarized_path != primary_target_path:
+                bin_img = Image.open(binarized_path)
+                if max(bin_img.size) > MAX_IMAGE_DIMENSION:
+                    sc = MAX_IMAGE_DIMENSION / float(max(bin_img.size))
+                    bin_img = bin_img.resize((int(round(bin_img.width * sc)), int(round(bin_img.height * sc))), Image.Resampling.BILINEAR)
+                c_lines, c_words, c_blocks, c_conf = self._run_pass(bin_img, primary_cfg)
+                if len(c_words) > len(words) and c_conf >= avg_conf:
+                    lines, words, blocks, avg_conf, pass_used = c_lines, c_words, c_blocks, c_conf, "early_exit_binarized"
+                    raw_text_preview = "\n".join(l.text for l in lines)
+
+            if len(words) == 0 or avg_conf < 15.0:
+                logger.info("Fast early-exit: image remains illegible after binarized attempt. Terminating OCR early.")
+                return OCRResult(
+                    raw_text=raw_text_preview,
+                    average_confidence=round(avg_conf, 1),
+                    image_width=img_w,
+                    image_height=img_h,
+                    blocks=blocks,
+                    lines=lines,
+                    words=words,
+                    low_quality_warning=True,
+                    quality_message="Low image quality — please retake photo with better lighting, focus, and alignment.",
+                    pass_used=pass_used,
+                )
+
         # Adaptive Retry: Trigger if primary pass confidence is below threshold or too few words
         needs_retry = (avg_conf < OCR_CONFIDENCE_THRESHOLD) or (len(words) < 6)
         if needs_retry:
@@ -208,12 +251,20 @@ class TesseractOCREngine(BaseOCREngine):
 
             # Candidate A: Binarized (Otsu) with primary PSM
             if binarized_path and os.path.exists(binarized_path) and binarized_path != primary_target_path:
-                candidates.append((Image.open(binarized_path), primary_cfg, f"binarized (psm={self.primary_psm})"))
+                bin_img = Image.open(binarized_path)
+                if max(bin_img.size) > MAX_IMAGE_DIMENSION:
+                    sc = MAX_IMAGE_DIMENSION / float(max(bin_img.size))
+                    bin_img = bin_img.resize((int(round(bin_img.width * sc)), int(round(bin_img.height * sc))), Image.Resampling.BILINEAR)
+                candidates.append((bin_img, primary_cfg, f"binarized (psm={self.primary_psm})"))
 
             # Candidate B: Adaptive binarized if exists (useful for shadows/glare)
             adaptive_cand = base_path.parent / f"{base_path.stem}_adaptive.png"
             if adaptive_cand.exists() and len(candidates) < 1:
-                candidates.append((Image.open(str(adaptive_cand)), primary_cfg, "adaptive_binarized"))
+                adap_img = Image.open(str(adaptive_cand))
+                if max(adap_img.size) > MAX_IMAGE_DIMENSION:
+                    sc = MAX_IMAGE_DIMENSION / float(max(adap_img.size))
+                    adap_img = adap_img.resize((int(round(adap_img.width * sc)), int(round(adap_img.height * sc))), Image.Resampling.BILINEAR)
+                candidates.append((adap_img, primary_cfg, "adaptive_binarized"))
 
             # Candidate C: Sparse text PSM (only if very few words detected)
             if len(words) < 6:
@@ -228,9 +279,10 @@ class TesseractOCREngine(BaseOCREngine):
                 logger.info(f"Retry candidate '{cand_label}': {len(c_words)} words, avg conf: {c_conf:.1f}%")
 
                 # Prefer higher confidence or substantially more detected words
+                # Guard against replacing a rich pass with a low-word-count candidate
                 is_better = (
-                    (c_conf > best_conf + 3.0 and len(c_words) >= 4)
-                    or (len(c_words) > len(best_words) + 5 and c_conf >= best_conf - 5.0)
+                    (c_conf > best_conf + 4.0 and len(c_words) >= len(best_words))
+                    or (len(c_words) > len(best_words) + 3 and c_conf >= best_conf - 6.0)
                     or (len(best_words) < 4 and len(c_words) >= 4)
                 )
                 if is_better:

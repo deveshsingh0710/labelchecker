@@ -51,6 +51,79 @@ class ImagePreprocessor:
         self.clip_limit = clip_limit
         self.tile_grid_size = tile_grid_size
 
+    def detect_label_region(
+        self, image: np.ndarray
+    ) -> Tuple[np.ndarray, Optional[Tuple[int, int, int, int]], bool]:
+        """
+        Detects the most prominent rectangular/text-dense label region within the image.
+        Crops to isolate the packaging and eliminate background clutter (tables, desks).
+        If no confident candidate is found (or label occupies >= 88% of frame),
+        gracefully falls back to the full image.
+        """
+        h, w = image.shape[:2]
+        total_area = w * h
+        if total_area == 0:
+            return image, None, False
+
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
+
+        # 1. Morphological gradient to highlight edge/text structures
+        grad_x = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+        grad_y = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+        grad = cv2.magnitude(grad_x, grad_y)
+        grad = np.uint8(np.clip(grad, 0, 255))
+
+        # 2. Threshold high-frequency edges
+        _, thresh = cv2.threshold(grad, 35, 255, cv2.THRESH_BINARY)
+
+        # 3. Morphological closing with rectangular kernel to consolidate text blocks & package contours
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 25))
+        closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
+
+        # 4. Detect external contours
+        contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        best_box = None
+        best_score = 0.0
+
+        for c in contours:
+            x, y, bw, bh = cv2.boundingRect(c)
+            area = bw * bh
+            area_ratio = area / float(total_area)
+            aspect_ratio = bw / float(bh)
+
+            # Region must occupy between 15% and 88% of the image (less than 15% is clutter/artifact;
+            # greater than 88% means image is already full-frame label)
+            if 0.15 <= area_ratio <= 0.88 and 0.2 <= aspect_ratio <= 5.0:
+                roi_thresh = thresh[y : y + bh, x : x + bw]
+                density = np.sum(roi_thresh > 0) / float(area)
+
+                # Require substantial text/edge density within candidate
+                if density >= 0.12:
+                    score = area_ratio * (density ** 0.5)
+                    if score > best_score:
+                        best_score = score
+                        best_box = (x, y, bw, bh)
+
+        if best_box is not None and best_score >= 0.08:
+            x, y, bw, bh = best_box
+            pad_x = int(round(bw * 0.03))
+            pad_y = int(round(bh * 0.03))
+            x1 = max(0, x - pad_x)
+            y1 = max(0, y - pad_y)
+            x2 = min(w, x + bw + pad_x)
+            y2 = min(h, y + bh + pad_y)
+            crop_box = (x1, y1, x2 - x1, y2 - y1)
+            cropped = image[y1:y2, x1:x2]
+            logger.info(
+                f"Label region detected & cropped: box={crop_box} "
+                f"(area ratio: {((x2-x1)*(y2-y1))/total_area:.2%})"
+            )
+            return cropped, crop_box, True
+
+        logger.info("Label region detection: full-frame label or no clutter detected. Using uncropped image.")
+        return image, None, False
+
     def resize_image_if_needed(self, image: np.ndarray) -> Tuple[np.ndarray, bool, bool]:
         """Caps dimensions to MAX_IMAGE_DIMENSION or upscales low-res images < MIN_IMAGE_DIMENSION."""
         h, w = image.shape[:2]
@@ -203,9 +276,14 @@ class ImagePreprocessor:
 
         orig_h, orig_w = img.shape[:2]
 
+        # Stage 0: Label Region Detection & Cropping (isolate packaging from background clutter)
+        t0 = time.perf_counter()
+        target_img, crop_box, is_cropped = self.detect_label_region(img)
+        timing["label_region_crop_ms"] = round((time.perf_counter() - t0) * 1000, 2)
+
         # Stage 1: Resize if needed
         t0 = time.perf_counter()
-        resized_img, downscaled, upscaled = self.resize_image_if_needed(img)
+        resized_img, downscaled, upscaled = self.resize_image_if_needed(target_img)
         timing["resize_ms"] = round((time.perf_counter() - t0) * 1000, 2)
 
         # Stage 2: Glare reduction (CLAHE)
@@ -264,6 +342,7 @@ class ImagePreprocessor:
         logger.info(
             f"Preprocessing completed in {total_prep_ms}ms: "
             f"Deskew={angle:.2f}°, Upscaled={upscaled}, Downscaled={downscaled}, "
+            f"IsCropped={is_cropped}, "
             f"Files saved: [{Path(output_path).name}, {Path(binarized_path).name}]"
         )
 
@@ -286,6 +365,8 @@ class ImagePreprocessor:
                 "deskew_angle_deg": round(angle, 2),
                 "upscaled": upscaled,
                 "downscaled": downscaled,
+                "is_cropped": is_cropped,
+                "crop_box": list(crop_box) if crop_box else None,
                 "binarized_file": Path(binarized_path).name,
                 "grayscale_file": Path(grayscale_path).name,
                 "adaptive_file": Path(adaptive_path).name,

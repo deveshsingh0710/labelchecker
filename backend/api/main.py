@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Optional, List, Dict, Any
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Depends, Request, Header
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Depends, Request, Header, BackgroundTasks, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
@@ -30,6 +30,7 @@ from config import (
 from database import (
     get_db,
     init_db,
+    SessionLocal,
     Verification,
     Organization,
     User,
@@ -257,6 +258,213 @@ async def preprocess_image(
     }
 
 
+# In-memory tracking of background verification jobs
+VERIFY_JOBS: Dict[str, Dict[str, Any]] = {}
+
+
+def run_verification_pipeline(
+    file_id: str,
+    effective_org: str,
+    raw_path_str: str,
+    prep_path_str: str,
+    filename: str,
+) -> Dict[str, Any]:
+    """
+    Executes the full verification pipeline:
+    1. Preprocessing (deskew, glare balancing, denoising, label region cropping)
+    2. OCR extraction (Tesseract LSTM)
+    3. Rule 6 statutory field parsing
+    4. Compliance rule evaluation
+    5. Database persistence
+    Updates job status in VERIFY_JOBS dict for asynchronous polling clients.
+    """
+    t_verify_start = time.perf_counter()
+    timing: Dict[str, float] = {}
+    raw_path = Path(raw_path_str)
+    prep_path = Path(prep_path_str)
+
+    try:
+        # Phase 1: Preprocessing if needed
+        if file_id in VERIFY_JOBS:
+            VERIFY_JOBS[file_id].update({
+                "status": "PROCESSING",
+                "progress": 25,
+                "phase": "Isolating label region & OpenCV preprocessing",
+                "updated_at": time.time(),
+            })
+
+        t0 = time.perf_counter()
+        if not prep_path.exists():
+            preprocessor.process(str(raw_path), str(prep_path))
+        timing["image_prep_stage_ms"] = round((time.perf_counter() - t0) * 1000, 1)
+
+        binarized_path = PREPROCESSED_DIR / f"preprocessed_{file_id}_binarized.png"
+        grayscale_path = PREPROCESSED_DIR / f"preprocessed_{file_id}_grayscale.png"
+
+        # Phase 2: OCR extraction
+        if file_id in VERIFY_JOBS:
+            VERIFY_JOBS[file_id].update({
+                "status": "PROCESSING",
+                "progress": 60,
+                "phase": "Extracting text with Tesseract OCR",
+                "updated_at": time.time(),
+            })
+
+        t0 = time.perf_counter()
+        ocr_result = ocr_engine.extract(
+            str(prep_path),
+            raw_image_path=str(raw_path),
+            binarized_path=str(binarized_path) if binarized_path.exists() else None,
+            grayscale_path=str(grayscale_path) if grayscale_path.exists() else None,
+        )
+        timing["ocr_stage_ms"] = round((time.perf_counter() - t0) * 1000, 1)
+
+        raw_url = f"/static/uploads/{raw_path.name}"
+        prep_url = f"/static/preprocessed/{prep_path.name}"
+
+        if not ocr_result.raw_text.strip():
+            res_payload = {
+                "id": file_id,
+                "organization_id": effective_org,
+                "filename": filename,
+                "raw_image_url": raw_url,
+                "preprocessed_image_url": prep_url,
+                "ocr_summary": {
+                    "raw_text": "",
+                    "average_confidence": 0.0,
+                    "total_words": 0,
+                    "total_lines": 0,
+                    "low_quality_warning": True,
+                    "quality_message": "Low image quality — please retake photo with better lighting and focus.",
+                },
+                "overall_score": 0.0,
+                "compliance_status": "NON_COMPLIANT",
+                "total_passed": 0,
+                "total_failed": 0,
+                "total_needs_review": 0,
+                "extracted_fields": {},
+                "evaluation_results": [],
+                "error_message": "No readable text detected. Please ensure the label is sharp, well-lit, and not obstructed.",
+                "quality_warning": "Low image quality — please retake photo with better lighting and focus.",
+                "pdf_report_url": None,
+                "timing_ms": timing,
+            }
+            if file_id in VERIFY_JOBS:
+                VERIFY_JOBS[file_id].update({
+                    "status": "COMPLETED",
+                    "progress": 100,
+                    "phase": "Completed",
+                    "result": res_payload,
+                    "updated_at": time.time(),
+                })
+            return res_payload
+
+        # Phase 3: Field parsing
+        if file_id in VERIFY_JOBS:
+            VERIFY_JOBS[file_id].update({
+                "status": "PROCESSING",
+                "progress": 80,
+                "phase": "Parsing Legal Metrology statutory fields",
+                "updated_at": time.time(),
+            })
+
+        t0 = time.perf_counter()
+        parser = LabelFieldParser(ocr_result)
+        extracted_fields_dict = parser.extract_all()
+        timing["parsing_stage_ms"] = round((time.perf_counter() - t0) * 1000, 1)
+
+        # Phase 4: Compliance evaluation
+        if file_id in VERIFY_JOBS:
+            VERIFY_JOBS[file_id].update({
+                "status": "PROCESSING",
+                "progress": 90,
+                "phase": "Evaluating Rule 6 statutory compliance",
+                "updated_at": time.time(),
+            })
+
+        t0 = time.perf_counter()
+        compliance_summary = compliance_engine.evaluate(
+            extracted_fields_dict,
+            overall_ocr_confidence=ocr_result.average_confidence,
+        )
+        timing["compliance_eval_stage_ms"] = round((time.perf_counter() - t0) * 1000, 1)
+
+        serializable_fields = {k: v.to_dict() for k, v in extracted_fields_dict.items()}
+        serializable_eval = [item.to_dict() for item in compliance_summary.items]
+
+        # Phase 5: Persist to DB
+        t0 = time.perf_counter()
+        db = SessionLocal()
+        try:
+            verification_record = Verification(
+                id=file_id,
+                organization_id=effective_org,
+                filename=filename,
+                original_image=raw_url,
+                preprocessed_image=prep_url,
+                overall_score=compliance_summary.overall_score,
+                compliance_status=compliance_summary.compliance_status,
+                total_passed=compliance_summary.total_passed,
+                total_failed=compliance_summary.total_failed,
+                total_needs_review=compliance_summary.total_needs_review,
+                extracted_fields=json.dumps(serializable_fields),
+                evaluation_results=json.dumps(serializable_eval),
+            )
+            db.merge(verification_record)
+            db.commit()
+        finally:
+            db.close()
+
+        timing["db_commit_stage_ms"] = round((time.perf_counter() - t0) * 1000, 1)
+        total_verify_ms = round((time.perf_counter() - t_verify_start) * 1000, 1)
+        timing["total_verify_ms"] = total_verify_ms
+
+        res_payload = {
+            "id": file_id,
+            "organization_id": effective_org,
+            "filename": filename,
+            "raw_image_url": raw_url,
+            "preprocessed_image_url": prep_url,
+            "ocr_summary": ocr_result.to_dict(),
+            "overall_score": round(compliance_summary.overall_score, 1),
+            "compliance_status": compliance_summary.compliance_status,
+            "total_passed": compliance_summary.total_passed,
+            "total_failed": compliance_summary.total_failed,
+            "total_needs_review": compliance_summary.total_needs_review,
+            "extracted_fields": serializable_fields,
+            "evaluation_results": serializable_eval,
+            "quality_warning": ocr_result.quality_message if ocr_result.low_quality_warning else None,
+            "pdf_report_url": f"/api/verifications/{file_id}/pdf",
+            "timing_ms": timing,
+        }
+
+        if file_id in VERIFY_JOBS:
+            VERIFY_JOBS[file_id].update({
+                "status": "COMPLETED",
+                "progress": 100,
+                "phase": "Completed",
+                "result": res_payload,
+                "updated_at": time.time(),
+            })
+
+        logger.info(
+            f"Verification completed for {filename} ({file_id}) in {total_verify_ms}ms: "
+            f"Score={compliance_summary.overall_score:.1f}, Conf={ocr_result.average_confidence:.1f}%"
+        )
+        return res_payload
+
+    except Exception as e:
+        logger.error(f"Verification pipeline failed for {file_id}: {e}", exc_info=True)
+        if file_id in VERIFY_JOBS:
+            VERIFY_JOBS[file_id].update({
+                "status": "FAILED",
+                "error": str(e),
+                "phase": "Error",
+                "updated_at": time.time(),
+            })
+        raise
+
+
 @app.post("/api/verify")
 async def verify_label(
     file_id: Optional[str] = Form(None),
@@ -264,22 +472,20 @@ async def verify_label(
     sample_id: Optional[str] = Form(None),
     organization_id: Optional[str] = Form(None),
     x_organization_id: Optional[str] = Header(None, alias="X-Organization-Id"),
+    sync: bool = Query(False),
+    background_tasks: BackgroundTasks = None,
     db: Session = Depends(get_db),
-    request: Request = None
+    request: Request = None,
 ):
     """
     Step 2: Runs OCR extraction and rule engine compliance evaluation.
-    Persists result in SQLite database. PDF generation remains strictly on-demand.
+    Default async mode: enqueues background processing task and returns HTTP 202 Accepted.
+    Client polls GET /api/verify/status/{file_id} until completed.
+    Sync mode (?sync=true): executes synchronously and returns full result with HTTP 200.
     """
-    t_verify_start = time.perf_counter()
-    timing: Dict[str, float] = {}
-
     active_preprocessor = getattr(request.app.state, "preprocessor", preprocessor) if request else preprocessor
-    active_ocr = getattr(request.app.state, "ocr_engine", ocr_engine) if request else ocr_engine
-    active_compliance = getattr(request.app.state, "compliance_engine", compliance_engine) if request else compliance_engine
 
     # 1. Determine raw and preprocessed images
-    t0 = time.perf_counter()
     if file_id and isinstance(file_id, str) and file_id.strip():
         matched_raw = list(UPLOAD_DIR.glob(f"{file_id}.*"))
         if not matched_raw:
@@ -305,129 +511,84 @@ async def verify_label(
         filename = file.filename or "upload.jpg"
     else:
         raise HTTPException(status_code=400, detail="Must provide file_id, file, or sample_id")
-    timing["image_prep_stage_ms"] = round((time.perf_counter() - t0) * 1000, 1)
 
-    # Locate companion binarized / grayscale files
-    binarized_path = PREPROCESSED_DIR / f"preprocessed_{file_id}_binarized.png"
-    grayscale_path = PREPROCESSED_DIR / f"preprocessed_{file_id}_grayscale.png"
-
-    # 2. Run OCR extraction (fast single primary pass with adaptive retry)
-    t0 = time.perf_counter()
-    try:
-        ocr_result = await run_in_threadpool(
-            active_ocr.extract,
-            str(prep_path),
-            raw_image_path=str(raw_path),
-            binarized_path=str(binarized_path) if binarized_path.exists() else None,
-            grayscale_path=str(grayscale_path) if grayscale_path.exists() else None,
-        )
-    except Exception as e:
-        logger.error(f"OCR extraction failed for {file_id}: {e}")
-        raise HTTPException(status_code=500, detail=f"OCR extraction failed: {str(e)}")
-    timing["ocr_stage_ms"] = round((time.perf_counter() - t0) * 1000, 1)
-
-    if not ocr_result.raw_text.strip():
-        # Handle blank / illegible image gracefully
-        return JSONResponse(
-            status_code=200,
-            content={
-                "id": file_id,
-                "filename": filename,
-                "raw_image_url": f"/static/uploads/{raw_path.name}",
-                "preprocessed_image_url": f"/static/preprocessed/{prep_path.name}",
-                "ocr_summary": {
-                    "raw_text": "",
-                    "average_confidence": 0.0,
-                    "total_words": 0,
-                    "total_lines": 0,
-                    "low_quality_warning": True,
-                    "quality_message": "Low image quality — please retake photo with better lighting and focus."
-                },
-                "overall_score": 0.0,
-                "compliance_status": "NON_COMPLIANT",
-                "total_passed": 0,
-                "total_failed": 0,
-                "total_needs_review": 0,
-                "extracted_fields": {},
-                "evaluation_results": [],
-                "error_message": "No readable text detected. Please ensure the label is sharp, well-lit, and not obstructed.",
-                "quality_warning": "Low image quality — please retake photo with better lighting and focus.",
-                "pdf_report_url": None,
-                "timing_ms": timing
-            }
-        )
-
-    # 3. Parse fields
-    t0 = time.perf_counter()
-    parser = LabelFieldParser(ocr_result)
-    extracted_fields_dict = parser.extract_all()
-    timing["parsing_stage_ms"] = round((time.perf_counter() - t0) * 1000, 1)
-
-    # 4. Evaluate compliance rules
-    t0 = time.perf_counter()
-    compliance_summary = active_compliance.evaluate(
-        extracted_fields_dict,
-        overall_ocr_confidence=ocr_result.average_confidence
-    )
-    timing["compliance_eval_stage_ms"] = round((time.perf_counter() - t0) * 1000, 1)
-
-    # Serialize extracted fields and evaluation results
-    serializable_fields = {k: v.to_dict() for k, v in extracted_fields_dict.items()}
-    serializable_eval = [item.to_dict() for item in compliance_summary.items]
-
-    raw_url = f"/static/uploads/{raw_path.name}"
-    prep_url = f"/static/preprocessed/{prep_path.name}"
-
-    # 5. Persist into database
     effective_org = organization_id or x_organization_id or DEMO_ORG_BRAND_ID
-    t0 = time.perf_counter()
-    verification_record = Verification(
-        id=file_id,
-        organization_id=effective_org,
-        filename=filename,
-        original_image=raw_url,
-        preprocessed_image=prep_url,
-        overall_score=compliance_summary.overall_score,
-        compliance_status=compliance_summary.compliance_status,
-        total_passed=compliance_summary.total_passed,
-        total_failed=compliance_summary.total_failed,
-        total_needs_review=compliance_summary.total_needs_review,
-        extracted_fields=json.dumps(serializable_fields),
-        evaluation_results=json.dumps(serializable_eval)
-    )
 
-    db.merge(verification_record)
-    db.commit()
-    timing["db_commit_stage_ms"] = round((time.perf_counter() - t0) * 1000, 1)
+    # Synchronous execution mode (for testing or clients requiring blocking response)
+    if sync or background_tasks is None:
+        result = await run_in_threadpool(
+            run_verification_pipeline,
+            file_id,
+            effective_org,
+            str(raw_path),
+            str(prep_path),
+            filename,
+        )
+        return result
 
-    total_verify_ms = round((time.perf_counter() - t_verify_start) * 1000, 1)
-    timing["total_verify_ms"] = total_verify_ms
-
-    logger.info(
-        f"[/api/verify] Completed for {filename} (org: {effective_org}) in {total_verify_ms}ms: "
-        f"Prep={timing['image_prep_stage_ms']}ms, OCR={timing['ocr_stage_ms']}ms, "
-        f"Parse={timing['parsing_stage_ms']}ms, Eval={timing['compliance_eval_stage_ms']}ms, "
-        f"Score={compliance_summary.overall_score:.1f}, Conf={ocr_result.average_confidence:.1f}%"
-    )
-
-    return {
-        "id": file_id,
-        "organization_id": effective_org,
-        "filename": filename,
-        "raw_image_url": raw_url,
-        "preprocessed_image_url": prep_url,
-        "ocr_summary": ocr_result.to_dict(),
-        "overall_score": round(compliance_summary.overall_score, 1),
-        "compliance_status": compliance_summary.compliance_status,
-        "total_passed": compliance_summary.total_passed,
-        "total_failed": compliance_summary.total_failed,
-        "total_needs_review": compliance_summary.total_needs_review,
-        "extracted_fields": serializable_fields,
-        "evaluation_results": serializable_eval,
-        "quality_warning": ocr_result.quality_message if ocr_result.low_quality_warning else None,
-        "pdf_report_url": f"/api/verifications/{file_id}/pdf",
-        "timing_ms": timing
+    # Asynchronous execution mode: initialize job and spawn background task
+    VERIFY_JOBS[file_id] = {
+        "status": "PROCESSING",
+        "progress": 20,
+        "phase": "Isolating label region & preprocessing",
+        "result": None,
+        "error": None,
+        "updated_at": time.time(),
     }
+    background_tasks.add_task(
+        run_verification_pipeline,
+        file_id,
+        effective_org,
+        str(raw_path),
+        str(prep_path),
+        filename,
+    )
+
+    return JSONResponse(
+        status_code=202,
+        content={
+            "status": "PROCESSING",
+            "file_id": file_id,
+            "progress": 20,
+            "phase": "Isolating label region & preprocessing",
+            "message": "Verification analysis started in background",
+        },
+    )
+
+
+@app.get("/api/verify/status/{file_id}")
+def get_verification_status(
+    file_id: str,
+    db: Session = Depends(get_db),
+):
+    """
+    Polls the verification job progress for an asynchronous verification.
+    Returns status: PROCESSING | COMPLETED | FAILED along with progress % and result.
+    """
+    if file_id in VERIFY_JOBS:
+        job = VERIFY_JOBS[file_id]
+        return {
+            "status": job["status"],
+            "progress": job.get("progress", 0),
+            "phase": job.get("phase", ""),
+            "result": job.get("result"),
+            "error": job.get("error"),
+            "file_id": file_id,
+        }
+
+    # Fallback to database if completed earlier or job dict cleared
+    record = db.query(Verification).filter(Verification.id == file_id).first()
+    if record:
+        return {
+            "status": "COMPLETED",
+            "progress": 100,
+            "phase": "Completed",
+            "result": record.to_dict(),
+            "error": None,
+            "file_id": file_id,
+        }
+
+    raise HTTPException(status_code=404, detail=f"Verification job '{file_id}' not found")
 
 
 @app.get("/api/verifications")

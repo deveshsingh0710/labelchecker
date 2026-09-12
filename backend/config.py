@@ -73,7 +73,7 @@ TESSERACT_PSM_SPARSE = int(os.getenv("TESSERACT_PSM_SPARSE", "11"))  # 11 = spar
 TESSERACT_EXTRA_CONFIG = os.getenv("TESSERACT_EXTRA_CONFIG", "-c load_system_dawg=0 -c load_freq_dawg=0")
 
 # Image Preprocessing & Dimension Caps (Optimized for speed & accuracy on cloud vCPUs)
-MAX_IMAGE_DIMENSION = int(os.getenv("MAX_IMAGE_DIMENSION", "1800"))  # Downscale if larger to prevent bottlenecks
+MAX_IMAGE_DIMENSION = int(os.getenv("MAX_IMAGE_DIMENSION", "1600"))  # Downscale if larger to prevent bottlenecks
 MIN_IMAGE_DIMENSION = int(os.getenv("MIN_IMAGE_DIMENSION", "1400"))  # Target 25-35px character height
 DESKEW_MIN_ANGLE = float(os.getenv("DESKEW_MIN_ANGLE", "0.5"))  # Skip deskewing below this angle in degrees
 DESKEW_MAX_ANGLE = float(os.getenv("DESKEW_MAX_ANGLE", "6.0"))  # Skip if angle seems to be package skew rather than text line
