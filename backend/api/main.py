@@ -14,6 +14,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
+from starlette.concurrency import run_in_threadpool
 
 from config import (
     BASE_DIR,
@@ -225,7 +226,7 @@ async def preprocess_image(
 
     t_prep_start = time.perf_counter()
     try:
-        prep_result = active_preprocessor.process(str(raw_path), str(prep_path))
+        prep_result = await run_in_threadpool(active_preprocessor.process, str(raw_path), str(prep_path))
     except Exception as e:
         logger.error(f"Image preprocessing failed for {file_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Image preprocessing failed: {str(e)}")
@@ -313,7 +314,8 @@ async def verify_label(
     # 2. Run OCR extraction (fast single primary pass with adaptive retry)
     t0 = time.perf_counter()
     try:
-        ocr_result = active_ocr.extract(
+        ocr_result = await run_in_threadpool(
+            active_ocr.extract,
             str(prep_path),
             raw_image_path=str(raw_path),
             binarized_path=str(binarized_path) if binarized_path.exists() else None,

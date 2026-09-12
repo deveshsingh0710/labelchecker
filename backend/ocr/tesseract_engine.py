@@ -54,6 +54,7 @@ class TesseractOCREngine(BaseOCREngine):
         kw = {
             "output_type": Output.DICT,
             "config": config_str,
+            "timeout": 12,
         }
 
         try:
@@ -196,12 +197,11 @@ class TesseractOCREngine(BaseOCREngine):
             logger.debug(f"Word confidence range: min={conf_min:.1f}%, max={conf_max:.1f}%")
             logger.debug(f"Raw OCR text preview:\n{raw_text_preview[:400]}")
 
-        # Adaptive Retry: If confidence is low or very few words detected, retry with fallback variant
+        # Adaptive Retry: Trigger if primary pass confidence is below threshold or too few words
         needs_retry = (avg_conf < OCR_CONFIDENCE_THRESHOLD) or (len(words) < 6)
         if needs_retry:
             logger.info(
-                f"OCR confidence ({avg_conf:.1f}%) or word count ({len(words)}) below threshold "
-                f"({OCR_CONFIDENCE_THRESHOLD}%). Initiating adaptive retry pass..."
+                f"OCR confidence ({avg_conf:.1f}%) or word count ({len(words)}) requires retry pass..."
             )
 
             candidates: List[Tuple[Image.Image, str, str]] = []
@@ -210,16 +210,17 @@ class TesseractOCREngine(BaseOCREngine):
             if binarized_path and os.path.exists(binarized_path) and binarized_path != primary_target_path:
                 candidates.append((Image.open(binarized_path), primary_cfg, f"binarized (psm={self.primary_psm})"))
 
-            # Candidate B: Primary image with sparse text PSM (PSM 11)
-            sparse_cfg = f"--oem {self.oem} --psm {self.sparse_psm} {extra}".strip()
-            candidates.append((primary_img, sparse_cfg, f"sparse (psm={self.sparse_psm})"))
-
-            # Candidate C: Adaptive binarized if exists (useful for shadows/glare)
+            # Candidate B: Adaptive binarized if exists (useful for shadows/glare)
             adaptive_cand = base_path.parent / f"{base_path.stem}_adaptive.png"
-            if adaptive_cand.exists():
+            if adaptive_cand.exists() and len(candidates) < 1:
                 candidates.append((Image.open(str(adaptive_cand)), primary_cfg, "adaptive_binarized"))
 
-            # Evaluate retry candidates
+            # Candidate C: Sparse text PSM (only if very few words detected)
+            if len(words) < 6:
+                sparse_cfg = f"--oem {self.oem} --psm {self.sparse_psm} {extra}".strip()
+                candidates.append((primary_img, sparse_cfg, f"sparse (psm={self.sparse_psm})"))
+
+            # Evaluate retry candidates with early exit
             best_lines, best_words, best_blocks, best_conf, best_pass = lines, words, blocks, avg_conf, pass_used
 
             for cand_img, cand_cfg, cand_label in candidates:
@@ -240,6 +241,10 @@ class TesseractOCREngine(BaseOCREngine):
                         c_conf,
                         f"retry_{cand_label}",
                     )
+
+                # Early exit if candidate achieved strong confidence & words
+                if best_conf >= 70.0 and len(best_words) >= 15:
+                    break
 
             lines, words, blocks, avg_conf, pass_used = best_lines, best_words, best_blocks, best_conf, best_pass
             raw_text_preview = "\n".join(l.text for l in lines)
