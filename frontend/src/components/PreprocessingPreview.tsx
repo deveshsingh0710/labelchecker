@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { Sparkles, CheckCircle2, RotateCcw, ArrowRight } from 'lucide-react';
 import type { PreprocessingData } from '../types';
+import { getAssetUrl } from '../config';
 
 interface PreprocessingPreviewProps {
   data: PreprocessingData;
@@ -71,7 +72,7 @@ export const PreprocessingPreview: React.FC<PreprocessingPreviewProps> = ({
                 Original Image
               </span>
               <img
-                src={data.raw_image_url}
+                src={getAssetUrl(data.raw_image_url)}
                 alt="Original Upload"
                 className="max-h-[380px] object-contain rounded-lg shadow-sm"
               />
@@ -82,7 +83,7 @@ export const PreprocessingPreview: React.FC<PreprocessingPreviewProps> = ({
                 <span>OpenCV Preprocessed</span>
               </span>
               <img
-                src={data.preprocessed_image_url}
+                src={getAssetUrl(data.preprocessed_image_url)}
                 alt="Preprocessed Label"
                 className="max-h-[380px] object-contain rounded-lg shadow-sm"
               />
@@ -91,7 +92,7 @@ export const PreprocessingPreview: React.FC<PreprocessingPreviewProps> = ({
         ) : (
           <div className="p-4 flex flex-col items-center justify-center w-full">
             <img
-              src={activeView === 'preprocessed' ? data.preprocessed_image_url : data.raw_image_url}
+              src={getAssetUrl(activeView === 'preprocessed' ? data.preprocessed_image_url : data.raw_image_url)}
               alt="Preview"
               className="max-h-[440px] object-contain rounded-lg shadow-sm"
             />

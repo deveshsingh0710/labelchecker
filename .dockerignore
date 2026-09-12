@@ -1,0 +1,42 @@
+# Git
+.git
+.gitignore
+
+# Frontend (handled separately on Vercel)
+frontend/
+node_modules/
+
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.venv/
+venv/
+env/
+
+# Test caches & artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local databases & uploads (mounted via persistent disk or cloud DB in prod)
+backend/data/labelcheck.db
+backend/data/uploads/*
+!backend/data/uploads/.gitkeep
+backend/data/preprocessed/*
+!backend/data/preprocessed/.gitkeep
+backend/data/reports/*
+!backend/data/reports/.gitkeep
+
+# Environment files with secrets
+*.env
+*.env.local
+*.env.*.local
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.bat

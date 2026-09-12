@@ -1,0 +1,47 @@
+# ==============================================================================
+# Render Blueprint Specification (Infrastructure as Code)
+# ==============================================================================
+# Deploys:
+# 1. Managed PostgreSQL Database (Free tier)
+# 2. Containerized FastAPI Web Service with Tesseract OCR & OpenCV
+# 3. Persistent Disk for label image uploads and PDF audit reports
+# ==============================================================================
+
+databases:
+  - name: labelcheck-db
+    databaseName: labelcheck
+    user: labelcheck_user
+    plan: free
+    region: oregon
+
+services:
+  - type: web
+    name: labelcheck-backend
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    region: oregon
+    healthCheckPath: /api/health
+    disk:
+      name: labelcheck-storage
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: PORT
+        value: 10000
+      - key: HOST
+        value: 0.0.0.0
+      - key: DATABASE_URL
+        fromDatabase:
+          name: labelcheck-db
+          property: connectionString
+      - key: DATA_DIR
+        value: /var/data
+      - key: CORS_ORIGINS
+        value: "*"
+      - key: AUTH_SALT
+        generateValue: true
+      - key: OCR_CONFIDENCE_THRESHOLD
+        value: "65.0"
+      - key: LOW_QUALITY_THRESHOLD
+        value: "40.0"

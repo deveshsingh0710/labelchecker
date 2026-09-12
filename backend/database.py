@@ -15,7 +15,7 @@ from sqlalchemy import (
     text,
 )
 from sqlalchemy.orm import declarative_base, relationship, sessionmaker
-from config import DATABASE_URL
+from config import DATABASE_URL, AUTH_SALT
 
 engine = create_engine(
     DATABASE_URL,
@@ -27,8 +27,7 @@ Base = declarative_base()
 
 def hash_password(password: str) -> str:
     """Deterministic salted SHA256 hash for demo-grade auth."""
-    salt = "labelcheck_salt_2026"
-    return hashlib.sha256(f"{salt}_{password}".encode("utf-8")).hexdigest()
+    return hashlib.sha256(f"{AUTH_SALT}_{password}".encode("utf-8")).hexdigest()
 
 
 class Organization(Base):
@@ -150,16 +149,17 @@ def init_db():
     """Initializes tables, handles SQLite column migrations, and seeds demo tenants."""
     Base.metadata.create_all(bind=engine)
 
-    # SQLite migration: add organization_id to verifications if table already existed
-    with engine.connect() as conn:
-        try:
-            cols_res = conn.execute(text("PRAGMA table_info(verifications)"))
-            cols = [row[1] for row in cols_res.fetchall()]
-            if "organization_id" not in cols:
-                conn.execute(text("ALTER TABLE verifications ADD COLUMN organization_id VARCHAR(36)"))
-                conn.commit()
-        except Exception:
-            pass
+    # SQLite migration: add organization_id to verifications if table already existed on SQLite
+    if "sqlite" in DATABASE_URL:
+        with engine.connect() as conn:
+            try:
+                cols_res = conn.execute(text("PRAGMA table_info(verifications)"))
+                cols = [row[1] for row in cols_res.fetchall()]
+                if "organization_id" not in cols:
+                    conn.execute(text("ALTER TABLE verifications ADD COLUMN organization_id VARCHAR(36)"))
+                    conn.commit()
+            except Exception:
+                pass
 
     # Seed default demo organizations and demo users
     db = SessionLocal()

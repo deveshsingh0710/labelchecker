@@ -22,6 +22,9 @@ from config import (
     PREPROCESSED_DIR,
     REPORTS_DIR,
     SAMPLES_DIR,
+    HOST,
+    PORT,
+    CORS_ORIGINS,
 )
 from database import (
     get_db,
@@ -124,10 +127,11 @@ app = FastAPI(
 )
 
 # Enable CORS for React frontend
+is_wildcard = "*" in CORS_ORIGINS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=CORS_ORIGINS,
+    allow_credentials=not is_wildcard,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -688,4 +692,4 @@ def submit_demo_request(req: DemoSubmission, db: Session = Depends(get_db)):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8001)
+    uvicorn.run(app, host=HOST, port=PORT)

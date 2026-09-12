@@ -1,11 +1,23 @@
 import os
+import shutil
 from pathlib import Path
 from pydantic import BaseModel
 
 BASE_DIR = Path(__file__).resolve().parent
 
+# Server Binding
+HOST = os.getenv("HOST", "0.0.0.0")
+PORT = int(os.getenv("PORT", "8001"))
+
+# CORS Configuration
+raw_cors = os.getenv("CORS_ORIGINS", "*")
+CORS_ORIGINS = [origin.strip() for origin in raw_cors.split(",") if origin.strip()]
+
+# Security & Auth
+AUTH_SALT = os.getenv("AUTH_SALT", "labelcheck_salt_2026")
+
 # Ensure data directories exist
-DATA_DIR = BASE_DIR / "data"
+DATA_DIR = Path(os.getenv("DATA_DIR", str(BASE_DIR / "data")))
 UPLOAD_DIR = DATA_DIR / "uploads"
 PREPROCESSED_DIR = DATA_DIR / "preprocessed"
 REPORTS_DIR = DATA_DIR / "reports"
@@ -14,25 +26,39 @@ SAMPLES_DIR = DATA_DIR / "samples"
 for directory in (DATA_DIR, UPLOAD_DIR, PREPROCESSED_DIR, REPORTS_DIR, SAMPLES_DIR):
     directory.mkdir(parents=True, exist_ok=True)
 
-# Tesseract executable detection
-DEFAULT_TESSERACT_PATHS = [
-    os.getenv("TESSERACT_CMD"),
-    r"C:\msys64\ucrt64\bin\tesseract.exe",
-    r"C:\Program Files\Tesseract-OCR\tesseract.exe",
-    r"C:\Users\devesh singh\AppData\Local\Programs\Tesseract-OCR\tesseract.exe",
-    "tesseract"
-]
-
+# Tesseract executable detection (cross-platform Linux/Docker + Windows)
 def get_tesseract_cmd() -> str:
-    for path in DEFAULT_TESSERACT_PATHS:
-        if path and (os.path.exists(path) or path == "tesseract"):
+    # 1. User-configured environment variable
+    env_cmd = os.getenv("TESSERACT_CMD")
+    if env_cmd and (os.path.exists(env_cmd) or shutil.which(env_cmd)):
+        return env_cmd
+
+    # 2. System PATH check (standard on Linux / Docker containers)
+    which_path = shutil.which("tesseract")
+    if which_path:
+        return which_path
+
+    # 3. Known Windows installations fallback
+    windows_fallbacks = [
+        r"C:\msys64\ucrt64\bin\tesseract.exe",
+        r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+        r"C:\Users\devesh singh\AppData\Local\Programs\Tesseract-OCR\tesseract.exe",
+    ]
+    for path in windows_fallbacks:
+        if os.path.exists(path):
             return path
+
     return "tesseract"
 
 TESSERACT_CMD = get_tesseract_cmd()
 
-# Database
-DATABASE_URL = os.getenv("DATABASE_URL", f"sqlite:///{DATA_DIR / 'labelcheck.db'}")
+# Database URL with Postgres dialect normalization
+raw_db_url = os.getenv("DATABASE_URL", f"sqlite:///{DATA_DIR / 'labelcheck.db'}")
+if raw_db_url.startswith("postgres://"):
+    # SQLAlchemy requires postgresql:// instead of postgres://
+    DATABASE_URL = raw_db_url.replace("postgres://", "postgresql://", 1)
+else:
+    DATABASE_URL = raw_db_url
 
 # Compliance Thresholds
 OCR_CONFIDENCE_THRESHOLD = float(os.getenv("OCR_CONFIDENCE_THRESHOLD", "65.0"))

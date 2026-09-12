@@ -8,6 +8,7 @@ import {
   Scale
 } from 'lucide-react';
 import type { VerificationResult } from '../types';
+import { getAssetUrl } from '../config';
 
 interface InspectorViewProps {
   result: VerificationResult;
@@ -102,7 +103,7 @@ export const InspectorView: React.FC<InspectorViewProps> = ({
 
           <div className="rounded-xl overflow-hidden bg-slate-100 border border-slate-200 aspect-3/4 flex items-center justify-center">
             <img
-              src={result.preprocessed_image_url || result.raw_image_url}
+              src={getAssetUrl(result.preprocessed_image_url || result.raw_image_url)}
               alt="Inspected Packaging"
               className="w-full h-full object-contain"
             />

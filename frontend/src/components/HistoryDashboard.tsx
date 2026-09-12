@@ -28,6 +28,7 @@ import {
   PieChart as PieIcon
 } from 'lucide-react';
 import type { VerificationResult, AnalyticsData, Organization } from '../types';
+import { getAssetUrl } from '../config';
 
 interface HistoryDashboardProps {
   onInspect: (id: string) => void;
@@ -361,7 +362,7 @@ export const HistoryDashboard: React.FC<HistoryDashboardProps> = ({ onInspect, a
                   <tr key={item.id} className="hover:bg-slate-50/70 transition-colors">
                     <td className="py-3 px-4">
                       <img
-                        src={item.preprocessed_image_url || item.raw_image_url}
+                        src={getAssetUrl(item.preprocessed_image_url || item.raw_image_url)}
                         alt={item.filename}
                         className="w-12 h-12 object-cover rounded-lg border border-slate-200 shadow-xs"
                       />
@@ -399,7 +400,7 @@ export const HistoryDashboard: React.FC<HistoryDashboardProps> = ({ onInspect, a
                         <span>View</span>
                       </button>
                       <a
-                        href={`/api/verifications/${item.id}/pdf`}
+                        href={getAssetUrl(`/api/verifications/${item.id}/pdf`)}
                         download
                         className="px-2.5 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium transition-colors inline-flex items-center space-x-1"
                       >

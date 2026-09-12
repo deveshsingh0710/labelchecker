@@ -14,6 +14,12 @@ import { DemoRequestModal } from './components/DemoRequestModal';
 import { AuthModal } from './components/AuthModal';
 import type { PreprocessingData, VerificationResult, SampleLabel, Organization, User } from './types';
 import { AlertCircle, ArrowLeft, Briefcase, Eye, Sparkles } from 'lucide-react';
+import { API_BASE_URL, getAssetUrl } from './config';
+
+// Set global base URL for Axios in production
+if (API_BASE_URL) {
+  axios.defaults.baseURL = API_BASE_URL;
+}
 
 export const App: React.FC = () => {
   const [activeTab, setActiveTab] = useState<'verifier' | 'analytics' | 'pricing' | 'guide'>('verifier');
@@ -161,7 +167,7 @@ export const App: React.FC = () => {
   const handleDownloadReport = () => {
     if (!verificationResult?.id) return;
     setIsDownloadingPdf(true);
-    const downloadUrl = `/api/verifications/${verificationResult.id}/pdf`;
+    const downloadUrl = getAssetUrl(`/api/verifications/${verificationResult.id}/pdf`);
     const link = document.createElement('a');
     link.href = downloadUrl;
     link.setAttribute('download', `LabelCheck_Report_${verificationResult.id}.pdf`);
@@ -328,7 +334,7 @@ export const App: React.FC = () => {
                       {/* Left Column: Image with Bounding Box Overlay */}
                       <div className="lg:col-span-6 sticky top-20">
                         <BoundingBoxOverlay
-                          imageUrl={verificationResult.preprocessed_image_url || verificationResult.raw_image_url}
+                          imageUrl={getAssetUrl(verificationResult.preprocessed_image_url || verificationResult.raw_image_url)}
                           items={verificationResult.evaluation_results}
                           highlightedRuleId={highlightedRuleId}
                           onSelectRule={setHighlightedRuleId}
