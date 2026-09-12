@@ -126,6 +126,35 @@ class TestPipelineOptimization(unittest.TestCase):
         finally:
             db.close()
 
+    def test_ocr_hard_dimension_cap_to_1200(self):
+        """Verifies that images larger than 1200px are strictly downscaled before OCR."""
+        from PIL import Image
+        large_img = Image.new("RGB", (2000, 1500), color=(255, 255, 255))
+        capped_img, w, h = self.ocr_engine._enforce_max_dimension(large_img)
+        self.assertLessEqual(max(w, h), 1200)
+        self.assertEqual(w, 1200)
+        self.assertEqual(h, 900)
+
+    def test_ocr_distinct_timeout_error_payload(self):
+        """Verifies that an OCR timeout produces a distinct TIMEOUT error type."""
+        from ocr.base import OCRResult
+        timed_out_ocr = OCRResult(
+            raw_text="",
+            average_confidence=0.0,
+            image_width=800,
+            image_height=600,
+            low_quality_warning=True,
+            quality_message="Processing took too long, please try a smaller or clearer image.",
+            pass_used="timeout",
+            timed_out=True,
+            error_message="Processing took too long, please try a smaller or clearer image.",
+        )
+        self.assertTrue(timed_out_ocr.timed_out)
+        self.assertEqual(
+            timed_out_ocr.error_message,
+            "Processing took too long, please try a smaller or clearer image.",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

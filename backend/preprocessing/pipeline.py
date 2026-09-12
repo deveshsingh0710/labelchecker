@@ -321,7 +321,7 @@ class ImagePreprocessor:
         base_stem = Path(output_path).stem
 
         # 1. Color preview image (displayed on frontend)
-        cv2.imwrite(str(output_path), visual_preview, [cv2.IMWRITE_JPEG_QUALITY, 95])
+        cv2.imwrite(str(output_path), visual_preview, [cv2.IMWRITE_JPEG_QUALITY, 98])
 
         # 2. Otsu binarized image (primary OCR target)
         binarized_path = str(out_dir / f"{base_stem}_binarized.png")

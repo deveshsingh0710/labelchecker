@@ -72,8 +72,12 @@ TESSERACT_PSM_SPARSE = int(os.getenv("TESSERACT_PSM_SPARSE", "11"))  # 11 = spar
 # Disables dictionary-based auto-correction which causes hallucinatory character substitutions on codes/labels
 TESSERACT_EXTRA_CONFIG = os.getenv("TESSERACT_EXTRA_CONFIG", "-c load_system_dawg=0 -c load_freq_dawg=0")
 
-# Image Preprocessing & Dimension Caps (Optimized for speed & accuracy on cloud vCPUs)
-MAX_IMAGE_DIMENSION = int(os.getenv("MAX_IMAGE_DIMENSION", "1600"))  # Downscale if larger to prevent bottlenecks
-MIN_IMAGE_DIMENSION = int(os.getenv("MIN_IMAGE_DIMENSION", "1400"))  # Target 25-35px character height
+# Image Preprocessing & Dimension Caps (Hard-capped for low-latency on Render free tier)
+MAX_IMAGE_DIMENSION = int(os.getenv("MAX_IMAGE_DIMENSION", "1200"))  # Hard cap max 1200px to avoid Tesseract CPU timeouts
+MIN_IMAGE_DIMENSION = int(os.getenv("MIN_IMAGE_DIMENSION", "1200"))   # Minimum dimension for low-res upscale (matches cap)
 DESKEW_MIN_ANGLE = float(os.getenv("DESKEW_MIN_ANGLE", "0.5"))  # Skip deskewing below this angle in degrees
 DESKEW_MAX_ANGLE = float(os.getenv("DESKEW_MAX_ANGLE", "6.0"))  # Skip if angle seems to be package skew rather than text line
+
+# Performance & Timeout Thresholds
+OCR_SLOW_THRESHOLD_SEC = float(os.getenv("OCR_SLOW_THRESHOLD_SEC", "10.0"))  # Warn server-side if OCR exceeds 10s
+OCR_PER_PASS_TIMEOUT_SEC = int(os.getenv("OCR_PER_PASS_TIMEOUT_SEC", "25"))  # Per-pass safety timeout

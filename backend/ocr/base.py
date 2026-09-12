@@ -90,6 +90,8 @@ class OCRResult:
     low_quality_warning: bool = False
     quality_message: Optional[str] = None
     pass_used: str = "primary"
+    timed_out: bool = False
+    error_message: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -102,6 +104,8 @@ class OCRResult:
             "low_quality_warning": self.low_quality_warning,
             "quality_message": self.quality_message,
             "pass_used": self.pass_used,
+            "timed_out": self.timed_out,
+            "error_message": self.error_message,
         }
 
 

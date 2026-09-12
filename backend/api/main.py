@@ -317,12 +317,87 @@ def run_verification_pipeline(
             binarized_path=str(binarized_path) if binarized_path.exists() else None,
             grayscale_path=str(grayscale_path) if grayscale_path.exists() else None,
         )
-        timing["ocr_stage_ms"] = round((time.perf_counter() - t0) * 1000, 1)
+        ocr_duration_ms = round((time.perf_counter() - t0) * 1000, 1)
+        timing["ocr_stage_ms"] = ocr_duration_ms
+
+        if ocr_duration_ms > 10000:
+            logger.warning(
+                f"[PERFORMANCE WARNING] [/api/verify] OCR stage for '{filename}' ({file_id}) took "
+                f"{ocr_duration_ms / 1000.0:.2f}s (> 10.0s)!"
+            )
 
         raw_url = f"/static/uploads/{raw_path.name}"
         prep_url = f"/static/preprocessed/{prep_path.name}"
 
+        # Item 4: Distinct error handling for timeout vs crash vs genuine empty text
+        if ocr_result.timed_out:
+            logger.warning(f"Verification aborted for {file_id}: OCR processing timed out.")
+            res_payload = {
+                "id": file_id,
+                "organization_id": effective_org,
+                "filename": filename,
+                "raw_image_url": raw_url,
+                "preprocessed_image_url": prep_url,
+                "ocr_summary": ocr_result.to_dict(),
+                "overall_score": 0.0,
+                "compliance_status": "NON_COMPLIANT",
+                "total_passed": 0,
+                "total_failed": 0,
+                "total_needs_review": 0,
+                "extracted_fields": {},
+                "evaluation_results": [],
+                "error_message": "Processing took too long, please try a smaller or clearer image.",
+                "quality_warning": "Processing took too long, please try a smaller or clearer image.",
+                "pdf_report_url": None,
+                "timing_ms": timing,
+                "error_type": "TIMEOUT",
+            }
+            if file_id in VERIFY_JOBS:
+                VERIFY_JOBS[file_id].update({
+                    "status": "FAILED",
+                    "progress": 100,
+                    "phase": "Timeout",
+                    "error": "Processing took too long, please try a smaller or clearer image.",
+                    "result": res_payload,
+                    "updated_at": time.time(),
+                })
+            return res_payload
+
+        if ocr_result.error_message and not ocr_result.raw_text.strip():
+            logger.error(f"Verification aborted for {file_id}: {ocr_result.error_message}")
+            res_payload = {
+                "id": file_id,
+                "organization_id": effective_org,
+                "filename": filename,
+                "raw_image_url": raw_url,
+                "preprocessed_image_url": prep_url,
+                "ocr_summary": ocr_result.to_dict(),
+                "overall_score": 0.0,
+                "compliance_status": "NON_COMPLIANT",
+                "total_passed": 0,
+                "total_failed": 0,
+                "total_needs_review": 0,
+                "extracted_fields": {},
+                "evaluation_results": [],
+                "error_message": ocr_result.error_message,
+                "quality_warning": ocr_result.quality_message,
+                "pdf_report_url": None,
+                "timing_ms": timing,
+                "error_type": "ERROR",
+            }
+            if file_id in VERIFY_JOBS:
+                VERIFY_JOBS[file_id].update({
+                    "status": "FAILED",
+                    "progress": 100,
+                    "phase": "Error",
+                    "error": ocr_result.error_message,
+                    "result": res_payload,
+                    "updated_at": time.time(),
+                })
+            return res_payload
+
         if not ocr_result.raw_text.strip():
+            # Genuine empty OCR result (blank/obstructed label)
             res_payload = {
                 "id": file_id,
                 "organization_id": effective_org,
@@ -348,6 +423,7 @@ def run_verification_pipeline(
                 "quality_warning": "Low image quality — please retake photo with better lighting and focus.",
                 "pdf_report_url": None,
                 "timing_ms": timing,
+                "error_type": "EMPTY_TEXT",
             }
             if file_id in VERIFY_JOBS:
                 VERIFY_JOBS[file_id].update({

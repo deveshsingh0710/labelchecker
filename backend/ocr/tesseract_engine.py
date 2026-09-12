@@ -16,6 +16,8 @@ from config import (
     OCR_CONFIDENCE_THRESHOLD,
     LOW_QUALITY_THRESHOLD,
     MAX_IMAGE_DIMENSION,
+    OCR_SLOW_THRESHOLD_SEC,
+    OCR_PER_PASS_TIMEOUT_SEC,
 )
 from .base import BaseOCREngine, OCRResult, OCRBlock, OCRLine, OCRWord, BoundingBox
 
@@ -26,11 +28,11 @@ logging.basicConfig(level=logging.INFO)
 class TesseractOCREngine(BaseOCREngine):
     """
     Optimized Tesseract OCR engine with:
+    - Hard dimension cap at 1200px before OCR to protect constrained vCPUs
     - Explicit OEM 1 (LSTM-only) and configurable PSM
-    - Single consolidated primary pass for high speed (< 1s)
-    - Detailed raw text & word-confidence logging
-    - Adaptive multi-pass retry on low confidence / sparse output
-    - Low-quality photo detection and warning flag
+    - Strictly at most 1 second OCR pass only if conf < threshold AND words < 3
+    - 10-second slow OCR logging for cloud diagnostics
+    - Distinct error state for timeouts vs empty text
     """
 
     def __init__(
@@ -39,6 +41,7 @@ class TesseractOCREngine(BaseOCREngine):
         oem: Optional[int] = None,
         primary_psm: Optional[int] = None,
         sparse_psm: Optional[int] = None,
+        max_dimension: Optional[int] = None,
     ):
         cmd = tesseract_cmd or TESSERACT_CMD
         if cmd:
@@ -46,23 +49,46 @@ class TesseractOCREngine(BaseOCREngine):
         self.oem = oem if oem is not None else TESSERACT_OEM
         self.primary_psm = primary_psm if primary_psm is not None else TESSERACT_PSM_PRIMARY
         self.sparse_psm = sparse_psm if sparse_psm is not None else TESSERACT_PSM_SPARSE
+        self.max_dimension = max_dimension or MAX_IMAGE_DIMENSION
+
+    def _enforce_max_dimension(self, img: Image.Image) -> Tuple[Image.Image, int, int]:
+        """Strictly caps image dimensions to max_dimension (1200px) on longest side."""
+        w, h = img.size
+        longest = max(w, h)
+        if longest > self.max_dimension:
+            scale = self.max_dimension / float(longest)
+            new_w = int(round(w * scale))
+            new_h = int(round(h * scale))
+            img = img.resize((new_w, new_h), Image.Resampling.BILINEAR)
+            logger.info(
+                f"Hard-capped OCR image dimension from ({w}, {h}) to ({new_w}, {new_h}) [cap: {self.max_dimension}px]"
+            )
+            return img, new_w, new_h
+        return img, w, h
 
     def _run_pass(
-        self, img: Image.Image, config_str: str
+        self, img: Image.Image, config_str: str, timeout_sec: Optional[int] = None
     ) -> Tuple[List[OCRLine], List[OCRWord], List[OCRBlock], float]:
         """Runs a single Tesseract image_to_data extraction with structured lines and words."""
-        img_w, img_h = img.size
+        img, img_w, img_h = self._enforce_max_dimension(img)
+        pass_timeout = timeout_sec or OCR_PER_PASS_TIMEOUT_SEC
         kw = {
             "output_type": Output.DICT,
             "config": config_str,
-            "timeout": 12,
+            "timeout": pass_timeout,
         }
 
         try:
             data = pytesseract.image_to_data(img, **kw)
+        except pytesseract.pytesseract.TesseractTimeoutError as te:
+            logger.error(f"Tesseract OCR pass timed out after {pass_timeout}s: {te}")
+            raise TimeoutError(f"Tesseract OCR pass timed out after {pass_timeout}s") from te
         except Exception as e:
+            if "timeout" in str(e).lower():
+                logger.error(f"Tesseract OCR pass timed out: {e}")
+                raise TimeoutError("Tesseract OCR pass timed out") from e
             logger.error(f"Tesseract OCR pass failed: {e}")
-            return [], [], [], 0.0
+            raise e
 
         words: List[OCRWord] = []
         lines_dict: Dict[tuple, List[OCRWord]] = {}
@@ -168,144 +194,132 @@ class TesseractOCREngine(BaseOCREngine):
             if cand_gray.exists():
                 grayscale_path = str(cand_gray)
 
-        # Primary pass image target: prefer clean contrast-enhanced grayscale, fallback to binarized or original
-        # Tesseract 5 LSTM performs best on continuous 8-bit grayscale rather than 1-bit thresholded bitmaps
+        # Primary pass image target: prefer preprocessed image (contrast balanced, deskewed, sharpened)
+        # Fallback to grayscale, binarized, or raw image if needed
         primary_target_path = (
-            grayscale_path
-            if (grayscale_path and os.path.exists(grayscale_path))
-            else (binarized_path if (binarized_path and os.path.exists(binarized_path)) else image_path)
+            image_path
+            if (image_path and os.path.exists(image_path))
+            else (grayscale_path if (grayscale_path and os.path.exists(grayscale_path)) else (binarized_path or image_path))
         )
         primary_img = Image.open(primary_target_path)
-        img_w, img_h = primary_img.size
-
-        # Cap maximum image dimension to MAX_IMAGE_DIMENSION to avoid CPU starvation on cloud hosts
-        if max(img_w, img_h) > MAX_IMAGE_DIMENSION:
-            scale = MAX_IMAGE_DIMENSION / float(max(img_w, img_h))
-            new_size = (int(round(img_w * scale)), int(round(img_h * scale)))
-            primary_img = primary_img.resize(new_size, Image.Resampling.BILINEAR)
-            img_w, img_h = new_size
-            logger.info(f"Capped primary OCR image dimension to {new_size}")
+        primary_img, img_w, img_h = self._enforce_max_dimension(primary_img)
 
         # Primary pass config with DAWG hallucination suppression
         extra = f" {TESSERACT_EXTRA_CONFIG}".strip() if TESSERACT_EXTRA_CONFIG else ""
         primary_cfg = f"--oem {self.oem} --psm {self.primary_psm} {extra}".strip()
-        logger.info(f"Running primary OCR pass on [{Path(primary_target_path).name}] with config '{primary_cfg}'")
-
-        lines, words, blocks, avg_conf = self._run_pass(primary_img, primary_cfg)
-        pass_used = f"primary (target={Path(primary_target_path).name}, psm={self.primary_psm})"
-
-        # Log raw Tesseract output & word confidence statistics
-        raw_text_preview = "\n".join(l.text for l in lines)
         logger.info(
-            f"Primary OCR output: {len(words)} words, {len(lines)} lines, avg conf: {avg_conf:.1f}%. "
-            f"Elapsed: {((time.perf_counter() - t0) * 1000):.1f}ms"
+            f"Running primary OCR pass on [{Path(primary_target_path).name}] ({img_w}x{img_h}) with config '{primary_cfg}'"
         )
-        if words:
-            conf_min = min(w.confidence for w in words)
-            conf_max = max(w.confidence for w in words)
-            logger.debug(f"Word confidence range: min={conf_min:.1f}%, max={conf_max:.1f}%")
-            logger.debug(f"Raw OCR text preview:\n{raw_text_preview[:400]}")
 
-        # Fast Early-Exit: If first pass confidence is extremely low (<15%) or 0 words found:
-        # Avoid wasting CPU running all remaining multi-pass variants sequentially.
-        # Skip straight to trying the cleaned binarized variant; if still empty/illegible, exit immediately.
-        is_severely_low = (avg_conf < 15.0) or (len(words) == 0)
-        if is_severely_low:
-            logger.info(
-                f"Severe low quality detected on primary pass (conf={avg_conf:.1f}%, words={len(words)}). "
-                f"Executing fast early-exit: attempting only cleaned binarized variant."
-            )
-            if binarized_path and os.path.exists(binarized_path) and binarized_path != primary_target_path:
-                bin_img = Image.open(binarized_path)
-                if max(bin_img.size) > MAX_IMAGE_DIMENSION:
-                    sc = MAX_IMAGE_DIMENSION / float(max(bin_img.size))
-                    bin_img = bin_img.resize((int(round(bin_img.width * sc)), int(round(bin_img.height * sc))), Image.Resampling.BILINEAR)
-                c_lines, c_words, c_blocks, c_conf = self._run_pass(bin_img, primary_cfg)
-                if len(c_words) > len(words) and c_conf >= avg_conf:
-                    lines, words, blocks, avg_conf, pass_used = c_lines, c_words, c_blocks, c_conf, "early_exit_binarized"
-                    raw_text_preview = "\n".join(l.text for l in lines)
+        try:
+            lines, words, blocks, avg_conf = self._run_pass(primary_img, primary_cfg)
+            pass_used = f"primary (target={Path(primary_target_path).name}, psm={self.primary_psm})"
 
-            if len(words) == 0 or avg_conf < 15.0:
-                logger.info("Fast early-exit: image remains illegible after binarized attempt. Terminating OCR early.")
-                return OCRResult(
-                    raw_text=raw_text_preview,
-                    average_confidence=round(avg_conf, 1),
-                    image_width=img_w,
-                    image_height=img_h,
-                    blocks=blocks,
-                    lines=lines,
-                    words=words,
-                    low_quality_warning=True,
-                    quality_message="Low image quality — please retake photo with better lighting, focus, and alignment.",
-                    pass_used=pass_used,
-                )
-
-        # Adaptive Retry: Trigger if primary pass confidence is below threshold or too few words
-        needs_retry = (avg_conf < OCR_CONFIDENCE_THRESHOLD) or (len(words) < 6)
-        if needs_retry:
-            logger.info(
-                f"OCR confidence ({avg_conf:.1f}%) or word count ({len(words)}) requires retry pass..."
-            )
-
-            candidates: List[Tuple[Image.Image, str, str]] = []
-
-            # Candidate A: Binarized (Otsu) with primary PSM
-            if binarized_path and os.path.exists(binarized_path) and binarized_path != primary_target_path:
-                bin_img = Image.open(binarized_path)
-                if max(bin_img.size) > MAX_IMAGE_DIMENSION:
-                    sc = MAX_IMAGE_DIMENSION / float(max(bin_img.size))
-                    bin_img = bin_img.resize((int(round(bin_img.width * sc)), int(round(bin_img.height * sc))), Image.Resampling.BILINEAR)
-                candidates.append((bin_img, primary_cfg, f"binarized (psm={self.primary_psm})"))
-
-            # Candidate B: Adaptive binarized if exists (useful for shadows/glare)
-            adaptive_cand = base_path.parent / f"{base_path.stem}_adaptive.png"
-            if adaptive_cand.exists() and len(candidates) < 1:
-                adap_img = Image.open(str(adaptive_cand))
-                if max(adap_img.size) > MAX_IMAGE_DIMENSION:
-                    sc = MAX_IMAGE_DIMENSION / float(max(adap_img.size))
-                    adap_img = adap_img.resize((int(round(adap_img.width * sc)), int(round(adap_img.height * sc))), Image.Resampling.BILINEAR)
-                candidates.append((adap_img, primary_cfg, "adaptive_binarized"))
-
-            # Candidate C: Sparse text PSM (only if very few words detected)
-            if len(words) < 6:
-                sparse_cfg = f"--oem {self.oem} --psm {self.sparse_psm} {extra}".strip()
-                candidates.append((primary_img, sparse_cfg, f"sparse (psm={self.sparse_psm})"))
-
-            # Evaluate retry candidates with early exit
-            best_lines, best_words, best_blocks, best_conf, best_pass = lines, words, blocks, avg_conf, pass_used
-
-            for cand_img, cand_cfg, cand_label in candidates:
-                c_lines, c_words, c_blocks, c_conf = self._run_pass(cand_img, cand_cfg)
-                logger.info(f"Retry candidate '{cand_label}': {len(c_words)} words, avg conf: {c_conf:.1f}%")
-
-                # Prefer higher confidence or substantially more detected words
-                # Guard against replacing a rich pass with a low-word-count candidate
-                is_better = (
-                    (c_conf > best_conf + 4.0 and len(c_words) >= len(best_words))
-                    or (len(c_words) > len(best_words) + 3 and c_conf >= best_conf - 6.0)
-                    or (len(best_words) < 4 and len(c_words) >= 4)
-                )
-                if is_better:
-                    best_lines, best_words, best_blocks, best_conf, best_pass = (
-                        c_lines,
-                        c_words,
-                        c_blocks,
-                        c_conf,
-                        f"retry_{cand_label}",
-                    )
-
-                # Early exit if candidate achieved strong confidence & words
-                if best_conf >= 70.0 and len(best_words) >= 15:
-                    break
-
-            lines, words, blocks, avg_conf, pass_used = best_lines, best_words, best_blocks, best_conf, best_pass
+            # Log raw Tesseract output & word confidence statistics
             raw_text_preview = "\n".join(l.text for l in lines)
-            logger.info(f"Selected OCR outcome after retry: {pass_used} (conf: {avg_conf:.1f}%, words: {len(words)})")
+            logger.info(
+                f"Primary OCR output: {len(words)} words, {len(lines)} lines, avg conf: {avg_conf:.1f}%. "
+                f"Elapsed: {((time.perf_counter() - t0) * 1000):.1f}ms"
+            )
 
+            # Fast Early-Exit on total illegibility / zero words
+            if avg_conf < 10.0 and len(words) == 0:
+                logger.info("Primary OCR produced 0 words and <10% confidence. Attempting single binarized fallback.")
+                if binarized_path and os.path.exists(binarized_path) and binarized_path != primary_target_path:
+                    bin_img = Image.open(binarized_path)
+                    bin_img, _, _ = self._enforce_max_dimension(bin_img)
+                    c_lines, c_words, c_blocks, c_conf = self._run_pass(bin_img, primary_cfg)
+                    if len(c_words) > 0:
+                        lines, words, blocks, avg_conf = c_lines, c_words, c_blocks, c_conf
+                        pass_used = f"early_exit_binarized (target={Path(binarized_path).name})"
+                        raw_text_preview = "\n".join(l.text for l in lines)
+                    else:
+                        logger.info("Binarized fallback also returned 0 words. Exiting OCR early.")
+
+            # Item 1: ONLY attempt a second OCR pass if confidence is below threshold AND words < 3
+            # Strictly at most 1 second pass — never run all 4 variants
+            needs_second_pass = (avg_conf < OCR_CONFIDENCE_THRESHOLD) and (len(words) < 3)
+
+            if needs_second_pass:
+                logger.info(
+                    f"Triggering second OCR pass: confidence ({avg_conf:.1f}% < {OCR_CONFIDENCE_THRESHOLD}%) "
+                    f"AND word count ({len(words)} < 3)..."
+                )
+
+                # Pick the single best alternative variant for the second pass
+                second_target_path = None
+                if binarized_path and os.path.exists(binarized_path) and binarized_path != primary_target_path:
+                    second_target_path = binarized_path
+                elif grayscale_path and os.path.exists(grayscale_path) and grayscale_path != primary_target_path:
+                    second_target_path = grayscale_path
+                else:
+                    cand_adap = base_path.parent / f"{base_path.stem}_adaptive.png"
+                    if cand_adap.exists():
+                        second_target_path = str(cand_adap)
+
+                if second_target_path:
+                    sec_img = Image.open(second_target_path)
+                    sec_img, _, _ = self._enforce_max_dimension(sec_img)
+                    logger.info(f"Running second (and final) OCR pass on [{Path(second_target_path).name}]")
+                    c_lines, c_words, c_blocks, c_conf = self._run_pass(sec_img, primary_cfg)
+                    logger.info(f"Second OCR pass result: {len(c_words)} words, avg conf: {c_conf:.1f}%")
+
+                    # Adopt second pass only if it genuinely improved over the first pass
+                    if len(c_words) > len(words) or (len(c_words) == len(words) and c_conf > avg_conf):
+                        lines, words, blocks, avg_conf = c_lines, c_words, c_blocks, c_conf
+                        pass_used = f"second_pass (target={Path(second_target_path).name})"
+                        raw_text_preview = "\n".join(l.text for l in lines)
+                else:
+                    logger.info("No alternative image variant available for second pass. Keeping primary pass.")
+
+        except TimeoutError as te:
+            total_elapsed_ms = round((time.perf_counter() - t0) * 1000, 1)
+            logger.error(f"[OCR TIMEOUT] OCR processing timed out after {total_elapsed_ms}ms: {te}")
+            return OCRResult(
+                raw_text="",
+                average_confidence=0.0,
+                image_width=img_w,
+                image_height=img_h,
+                blocks=[],
+                lines=[],
+                words=[],
+                low_quality_warning=True,
+                quality_message="Processing took too long, please try a smaller or clearer image.",
+                pass_used="timeout",
+                timed_out=True,
+                error_message="Processing took too long, please try a smaller or clearer image.",
+            )
+        except Exception as e:
+            total_elapsed_ms = round((time.perf_counter() - t0) * 1000, 1)
+            logger.error(f"[OCR ERROR] OCR processing crashed after {total_elapsed_ms}ms: {e}", exc_info=True)
+            return OCRResult(
+                raw_text="",
+                average_confidence=0.0,
+                image_width=img_w,
+                image_height=img_h,
+                blocks=[],
+                lines=[],
+                words=[],
+                low_quality_warning=True,
+                quality_message=f"OCR processing failed: {str(e)}. Please try a different photo.",
+                pass_used="error",
+                timed_out=False,
+                error_message=f"OCR processing failed: {str(e)}",
+            )
+
+        # Performance timing check: Item 3 log clearly whenever OCR takes longer than 10 seconds
         total_elapsed_ms = round((time.perf_counter() - t0) * 1000, 1)
+        total_elapsed_sec = total_elapsed_ms / 1000.0
+        if total_elapsed_sec > OCR_SLOW_THRESHOLD_SEC:
+            logger.warning(
+                f"[PERFORMANCE WARNING] OCR extraction took {total_elapsed_sec:.2f}s (> {OCR_SLOW_THRESHOLD_SEC}s threshold)! "
+                f"Image: {Path(image_path).name} ({img_w}x{img_h}), Pass: '{pass_used}', Words: {len(words)}"
+            )
+        else:
+            logger.info(f"OCR extraction completed in {total_elapsed_sec:.2f}s ({total_elapsed_ms}ms)")
 
-        # Quality warning determination
-        low_quality = (avg_conf < LOW_QUALITY_THRESHOLD) or (len(words) < 4)
+        # Low-quality determination
+        low_quality = (avg_conf < LOW_QUALITY_THRESHOLD) or (len(words) < 3)
         quality_msg = (
             "Low image quality — please retake photo with better lighting, focus, and alignment."
             if low_quality
@@ -323,4 +337,6 @@ class TesseractOCREngine(BaseOCREngine):
             low_quality_warning=low_quality,
             quality_message=quality_msg,
             pass_used=pass_used,
+            timed_out=False,
+            error_message=None,
         )

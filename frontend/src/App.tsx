@@ -16,10 +16,11 @@ import type { PreprocessingData, VerificationResult, SampleLabel, Organization, 
 import { AlertCircle, ArrowLeft, Briefcase, Eye, Sparkles } from 'lucide-react';
 import { API_BASE_URL, getAssetUrl } from './config';
 
-// Set global base URL for Axios in production
+// Set global base URL and 60s timeout for Axios
 if (API_BASE_URL) {
   axios.defaults.baseURL = API_BASE_URL;
 }
+axios.defaults.timeout = 60000; // 60s safe upper bound
 
 export const App: React.FC = () => {
   const [activeTab, setActiveTab] = useState<'verifier' | 'analytics' | 'pricing' | 'guide'>('verifier');
@@ -173,7 +174,7 @@ export const App: React.FC = () => {
       const fileId = postResp.data?.file_id || preprocessingData.file_id;
       let isComplete = false;
       let attempts = 0;
-      const maxAttempts = 60; // 60 * 1200ms = 72s max wait
+      const maxAttempts = 50; // 50 * 1200ms = 60s safe upper bound
 
       while (!isComplete && attempts < maxAttempts) {
         await new Promise((resolve) => setTimeout(resolve, 1200));
@@ -198,7 +199,11 @@ export const App: React.FC = () => {
             }
             break;
           } else if (job.status === 'FAILED') {
-            throw new Error(job.error || 'Verification analysis failed in background worker.');
+            const specificError =
+              job.result?.error_message ||
+              job.error ||
+              'Verification analysis failed in background worker.';
+            throw new Error(specificError);
           }
         } catch (pollErr: any) {
           if (pollErr.response?.status === 404 && attempts < 4) {
@@ -209,7 +214,7 @@ export const App: React.FC = () => {
       }
 
       if (!isComplete) {
-        throw new Error('Verification timed out after 70 seconds. Please retry with a clearer photo.');
+        throw new Error('Processing took too long, please try a smaller or clearer image.');
       }
     } catch (err: any) {
       console.error('Verification analysis failed:', err);
