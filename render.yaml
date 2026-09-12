@@ -3,8 +3,7 @@
 # ==============================================================================
 # Deploys:
 # 1. Managed PostgreSQL Database (Free tier)
-# 2. Containerized FastAPI Web Service with Tesseract OCR & OpenCV
-# 3. Persistent Disk for label image uploads and PDF audit reports
+# 2. Containerized FastAPI Web Service with Tesseract OCR & OpenCV (Free tier)
 # ==============================================================================
 
 databases:
@@ -22,10 +21,6 @@ services:
     plan: free
     region: oregon
     healthCheckPath: /api/health
-    disk:
-      name: labelcheck-storage
-      mountPath: /var/data
-      sizeGB: 1
     envVars:
       - key: PORT
         value: 10000
@@ -36,7 +31,7 @@ services:
           name: labelcheck-db
           property: connectionString
       - key: DATA_DIR
-        value: /var/data
+        value: /app/data
       - key: CORS_ORIGINS
         value: "*"
       - key: AUTH_SALT
